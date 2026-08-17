@@ -4,14 +4,19 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"strings"
 	"testing"
 )
+
+func denyOK(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "forbidden", http.StatusForbidden)
+}
 
 func TestMustDenyPassesOnForbidden(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(HeaderTenant) != "B" {
-			t.Fatalf("tenant header: got %q", r.Header.Get(HeaderTenant))
+		if r.Header.Get(HeaderTenant) != "B" || r.Header.Get(HeaderPrincipal) != "user-b" {
+			t.Fatalf("principal headers: tenant=%q id=%q", r.Header.Get(HeaderTenant), r.Header.Get(HeaderPrincipal))
 		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
@@ -119,12 +124,62 @@ func TestMustDenyFailsOnHeaderLeak(t *testing.T) {
 	}
 }
 
-func TestMustDenyRejectsEmptyBodyMustNotNeedle(t *testing.T) {
+func TestMustDenyFailsOnHeaderNameLeak(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Tenant-A-Region", "eu")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	if !mustDenyFailed(t, Case{
+		Name:      "name leak",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"Tenant-A"},
+		},
+	}, h) {
+		t.Fatal("MustDeny accepted a header name that named the other tenant")
+	}
+}
+
+func TestMustDenyIgnoresShortNeedleInContentType(t *testing.T) {
+	t.Parallel()
+	MustDeny(t, Case{
+		Name:      "utf-8 is not a leak",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"8"},
+		},
+	}, http.HandlerFunc(denyOK))
+}
+
+func TestMustDenyFailsOnTrailerLeak(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "X-Owner")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden\n"))
+		w.Header().Set("X-Owner", "tenant-A")
+	})
+	if !mustDenyFailed(t, Case{
+		Name:      "trailer leak",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h) {
+		t.Fatal("MustDeny accepted a trailer that named the other tenant")
+	}
+}
+
+func TestMustDenyRejectsEmptyBodyMustNotNeedle(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
 		Name:      "empty needle",
 		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
@@ -132,56 +187,101 @@ func TestMustDenyRejectsEmptyBodyMustNotNeedle(t *testing.T) {
 			Status:      []int{http.StatusForbidden},
 			BodyMustNot: []string{""},
 		},
-	}, h) {
-		t.Fatal("MustDeny skipped an empty BodyMustNot needle")
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "empty needle") {
+		t.Fatalf("want empty-needle validate, got failed=%v msg=%q panic=%v", got.failed, got.msg, got.panic)
+	}
+}
+
+func TestMustDenyRejectsEncodedBody(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "gzip",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") {
+		t.Fatalf("want Content-Encoding fail, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
 func TestMustDenyRejectsInvalidCase(t *testing.T) {
 	t.Parallel()
-	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	if !mustDenyFailed(t, Case{
-		Principal: Principal{Tenant: "B"},
+	got := runMustDeny(t, Case{
+		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/x"},
-	}, h) {
-		t.Fatal("MustDeny accepted a case with no Name")
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "Name is required") {
+		t.Fatalf("want Name validate, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
 func TestMustDenyRejectsStatus200(t *testing.T) {
 	t.Parallel()
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	if !mustDenyFailed(t, Case{
+	got := runMustDeny(t, Case{
 		Name:      "allowlisted 200",
 		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
 		Expect:    Expect{Status: []int{http.StatusOK}},
-	}, h) {
-		t.Fatal("MustDeny accepted Expect.Status 200")
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "not 403 or 404") {
+		t.Fatalf("want status validate, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsStatus401(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "auth-layer",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect:    Expect{Status: []int{http.StatusUnauthorized}},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "not 403 or 404") {
+		t.Fatalf("want 401 rejected, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
 func TestMustDenyRejectsZeroPrincipal(t *testing.T) {
 	t.Parallel()
-	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	if !mustDenyFailed(t, Case{
+	got := runMustDeny(t, Case{
 		Name:    "anon",
 		Request: Request{Method: http.MethodGet, Path: "/invoices/a"},
-	}, h) {
-		t.Fatal("MustDeny accepted an empty Principal with no ApplyPrincipal")
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant and Principal.ID") {
+		t.Fatalf("want principal validate, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsPartialPrincipal(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "id only",
+		Principal: Principal{ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant and Principal.ID") {
+		t.Fatalf("want both principal fields, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
 func TestMustDenyNilHandler(t *testing.T) {
 	t.Parallel()
-	if !mustDenyFailed(t, Case{
+	got := runMustDeny(t, Case{
 		Name:      "n",
-		Principal: Principal{ID: "user-b"},
+		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/x"},
-	}, nil) {
-		t.Fatal("MustDeny accepted a nil handler")
+	}, nil)
+	if !got.failed || !strings.Contains(got.msg, "handler is nil") {
+		t.Fatalf("want nil handler, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
@@ -226,6 +326,25 @@ func TestMustDenyCanonicalizesRequestHeaders(t *testing.T) {
 	}
 }
 
+func TestMustDenyRejectsDuplicateCanonicalHeaders(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "dup",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request: Request{
+			Method: http.MethodGet,
+			Path:   "/invoices/a",
+			Header: http.Header{
+				"authorization": []string{"Bearer a"},
+				"Authorization": []string{"Bearer b"},
+			},
+		},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "duplicate keys") {
+		t.Fatalf("want duplicate-key validate, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
 func TestMustDenyDoesNotMutateCallerStatus(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -245,13 +364,31 @@ func TestMustDenyDoesNotMutateCallerStatus(t *testing.T) {
 
 func TestMustDenyRejectsPathWithoutSlash(t *testing.T) {
 	t.Parallel()
-	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	if !mustDenyFailed(t, Case{
+	got := runMustDeny(t, Case{
 		Name:      "bad path",
-		Principal: Principal{Tenant: "B"},
+		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "invoices/a"},
-	}, h) {
-		t.Fatal("MustDeny accepted a path without a leading /")
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "must start with /") {
+		t.Fatalf("want path validate, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyContainsHandlerPanic(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("handler boom")
+	})
+	got := runMustDeny(t, Case{
+		Name:      "panic",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+	}, h)
+	if got.panic == nil {
+		t.Fatalf("panic escaped or was dropped: failed=%v msg=%q", got.failed, got.msg)
+	}
+	if !got.failed {
+		t.Fatal("contained panic was not treated as a failed MustDeny")
 	}
 }
 
@@ -265,41 +402,69 @@ func TestCorpusEmptyAndKindsStable(t *testing.T) {
 	}
 }
 
+type denyRun struct {
+	failed bool
+	msg    string
+	panic  any
+}
+
 func mustDenyFailed(t *testing.T, c Case, h http.Handler) bool {
+	t.Helper()
+	got := runMustDeny(t, c, h)
+	if got.panic != nil {
+		t.Fatalf("handler panicked: %v", got.panic)
+	}
+	return got.failed
+}
+
+func runMustDeny(t *testing.T, c Case, h http.Handler) denyRun {
 	t.Helper()
 	p := &probeT{TB: t}
 	done := make(chan struct{})
+	var panicVal any
 	go func() {
 		defer close(done)
+		defer func() {
+			if rec := recover(); rec != nil {
+				panicVal = rec
+				p.failed = true
+			}
+		}()
 		MustDeny(p, c, h)
 	}()
 	<-done
-	return p.failed
+	return denyRun{failed: p.failed, msg: p.msg, panic: panicVal}
 }
 
 type probeT struct {
 	testing.TB
 	failed bool
+	msg    string
 }
 
 func (p *probeT) Helper() {}
 
 func (p *probeT) Fail() { p.failed = true }
 
-func (p *probeT) Error(args ...any) { p.failed = true }
+func (p *probeT) Error(args ...any) {
+	p.failed = true
+	p.msg = fmt.Sprint(args...)
+}
 
 func (p *probeT) Errorf(format string, args ...any) {
 	p.failed = true
-	_ = fmt.Sprintf(format, args...)
+	p.msg = fmt.Sprintf(format, args...)
 }
 
 func (p *probeT) Fatal(args ...any) {
 	p.failed = true
+	p.msg = fmt.Sprint(args...)
 	runtime.Goexit()
 }
 
 func (p *probeT) Fatalf(format string, args ...any) {
 	p.failed = true
+	p.msg = fmt.Sprintf(format, args...)
 	runtime.Goexit()
 }
 

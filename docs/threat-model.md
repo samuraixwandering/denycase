@@ -37,12 +37,12 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 ## Fail-closed rules
 
 - Default expect is HTTP 403.
-- `Expect.Status` may only list 4xx codes. 2xx and 5xx in that list are invalid.
+- `Expect.Status` may only be 403 or 404. 401, 429, 2xx, and 5xx in that list are invalid.
 - A 2xx or 5xx response fails the test.
 - 404 fails unless the case lists 404 in `Expect.Status`. There is no hide-existence helper yet; 403 vs 404 as an enumeration oracle is not tested.
-- If `BodyMustNot` is set, a deny that still contains a foreign field in the raw body or in any response header value fails. An empty needle is invalid.
-- `BodyMustNot` does not decode `Content-Encoding` (gzip) and does not unescape JSON `\u003c` / `\u003e` / `\u0026`. Use needles that match the bytes the handler actually wrote.
-- A case with no principal (empty Tenant and ID) and no `ApplyPrincipal` is invalid, so an auth-layer 403 on an anonymous request cannot pass as a BOLA deny.
+- If `BodyMustNot` is set, a deny that still contains a foreign field in the raw body, in Location / Content-Location / ETag / Link values (headers or trailers), in any trailer value, or in any header or trailer *name* fails. An empty needle is invalid. Stdlib defaults such as `Content-Type: text/plain; charset=utf-8` are not scanned as values.
+- If `BodyMustNot` is set and `Content-Encoding` is present and not `identity`, the test fails. The library does not decode gzip. JSON `\u003c` / `\u003e` / `\u0026` are not unescaped; needles must match the bytes the handler wrote.
+- When `ApplyPrincipal` is nil, both `Principal.Tenant` and `Principal.ID` are required. A missing tenant header cannot pass as a BOLA deny.
 
 ## Residual risk
 

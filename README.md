@@ -13,7 +13,7 @@ denycase.MustDeny(t, denycase.Case{
 }, handler)
 ```
 
-By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Principal`. Set `ApplyPrincipal` to match how your app actually authenticates.
+By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Principal`. Both fields are required on that path. Set `ApplyPrincipal` to match how your app actually authenticates.
 
 v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
 
