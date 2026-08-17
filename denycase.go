@@ -15,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"unicode"
 )
 
 const (
@@ -87,9 +86,9 @@ type Case struct {
 	Request   Request
 	Expect    Expect
 	// ApplyPrincipal writes the principal onto the request. If nil, denycase
-	// sets HeaderTenant and HeaderPrincipal and requires both Principal
-	// fields. Wire this to your real auth (session, JWT, context) in
-	// application tests.
+	// sets HeaderTenant and HeaderPrincipal. Principal.Tenant and
+	// Principal.ID are always required. Wire this to your real auth
+	// (session, JWT, context) in application tests.
 	ApplyPrincipal func(*http.Request, Principal)
 }
 
@@ -147,6 +146,16 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		t.Fatalf("denycase: %s: status %d, want one of %v (fail closed)", c.Name, res.StatusCode, exp.Status)
 		return
 	}
+	for _, needle := range exp.BodyMustNot {
+		if name, ok := valuesContain(res.Header, headerNames, needle); ok {
+			t.Fatalf("denycase: %s: response header %s leaked %q", c.Name, name, needle)
+			return
+		}
+		if name, ok := valuesContain(res.Trailer, headerNames, needle); ok {
+			t.Fatalf("denycase: %s: response trailer %s leaked %q", c.Name, name, needle)
+			return
+		}
+	}
 	if len(exp.BodyMustNot) > 0 {
 		if enc, ok := nonIdentityEncoding(res.Header); ok {
 			t.Fatalf("denycase: %s: BodyMustNot set but Content-Encoding is %q", c.Name, enc)
@@ -158,21 +167,13 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 			t.Fatalf("denycase: %s: response leaked %q", c.Name, needle)
 			return
 		}
-		if name, ok := valuesContain(res.Header, headerNames, needle); ok {
-			t.Fatalf("denycase: %s: response header %s leaked %q", c.Name, name, needle)
-			return
-		}
-		if name, ok := valuesContain(res.Trailer, headerNames, needle); ok {
-			t.Fatalf("denycase: %s: response trailer %s leaked %q", c.Name, name, needle)
-			return
-		}
 	}
 }
 
 func newTestRequest(method, path string, body io.Reader) (req *http.Request, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			err = fmt.Errorf("invalid request %s %s: %v", method, path, rec)
+			err = fmt.Errorf("invalid request %q %q: %v", method, path, rec)
 		}
 	}()
 	return httptest.NewRequest(method, path, body), nil
@@ -209,32 +210,36 @@ func nonIdentityEncoding(h http.Header) (string, bool) {
 }
 
 func leakNames(extra []string) []string {
-	names := append([]string(nil), defaultLeakHeaders...)
-	for _, n := range extra {
-		names = append(names, http.CanonicalHeaderKey(n))
-	}
-	return names
+	return append(append([]string(nil), defaultLeakHeaders...), extra...)
 }
 
 // valuesContain reports whether any header in names has a value containing
 // needle. It ranges the map so a non-canonical key still matches. The
-// returned name is the map key as written.
+// returned name is the matching map keys as written, sorted.
+// httptest.Result builds trailers with canonical keys, so non-canonical
+// trailer keys do not occur there.
 func valuesContain(h http.Header, names []string, needle string) (string, bool) {
 	want := make(map[string]struct{}, len(names))
 	for _, n := range names {
 		want[http.CanonicalHeaderKey(n)] = struct{}{}
 	}
+	var hits []string
 	for k, vs := range h {
 		if _, ok := want[http.CanonicalHeaderKey(k)]; !ok {
 			continue
 		}
 		for _, v := range vs {
 			if strings.Contains(v, needle) {
-				return k, true
+				hits = append(hits, k)
+				break
 			}
 		}
 	}
-	return "", false
+	if len(hits) == 0 {
+		return "", false
+	}
+	slices.Sort(hits)
+	return strings.Join(hits, ", "), true
 }
 
 func (c Case) validate() error {
@@ -250,18 +255,13 @@ func (c Case) validate() error {
 	if err := validateRequestHeaders(c.Request.Header); err != nil {
 		return err
 	}
-	if c.ApplyPrincipal == nil {
-		if c.Principal.Tenant == "" || c.Principal.ID == "" {
-			return errors.New("Principal.Tenant and Principal.ID are required when ApplyPrincipal is nil")
-		}
+	if c.Principal.Tenant == "" || c.Principal.ID == "" {
+		return errors.New("Principal.Tenant and Principal.ID are required")
 	}
 	for _, s := range c.Expect.Status {
 		if s != http.StatusForbidden && s != http.StatusNotFound {
 			return fmt.Errorf("Expect.Status %d is not 403 or 404", s)
 		}
-	}
-	if len(c.Expect.HeaderMustNot) > 0 && len(c.Expect.BodyMustNot) == 0 {
-		return errors.New("HeaderMustNot requires BodyMustNot")
 	}
 	for _, needle := range c.Expect.BodyMustNot {
 		if needle == "" {
@@ -273,6 +273,9 @@ func (c Case) validate() error {
 			return err
 		}
 	}
+	if len(c.Expect.HeaderMustNot) > 0 && len(c.Expect.BodyMustNot) == 0 {
+		return errors.New("HeaderMustNot requires BodyMustNot")
+	}
 	return nil
 }
 
@@ -282,9 +285,14 @@ func validateRequestHeaders(h http.Header) error {
 	}
 	seen := make(map[string]string, len(h))
 	for k := range h {
+		if !validHeaderToken(k) {
+			return fmt.Errorf("Request.Header name %q is not a valid header token", k)
+		}
 		can := http.CanonicalHeaderKey(k)
 		if prev, ok := seen[can]; ok {
-			return fmt.Errorf("Request.Header has duplicate keys %q and %q", prev, k)
+			keys := []string{prev, k}
+			slices.Sort(keys)
+			return fmt.Errorf("Request.Header has duplicate keys %q and %q", keys[0], keys[1])
 		}
 		seen[can] = k
 	}
@@ -295,10 +303,8 @@ func validateMethod(method string) error {
 	if method == "" {
 		return errors.New("Request.Method is required")
 	}
-	for _, r := range method {
-		if unicode.IsSpace(r) {
-			return fmt.Errorf("Request.Method %q contains whitespace", method)
-		}
+	if !validHeaderToken(method) {
+		return fmt.Errorf("Request.Method %q is not a valid token", method)
 	}
 	return nil
 }
@@ -310,12 +316,19 @@ func validatePath(path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("Request.Path %q must start with /", path)
 	}
-	for _, r := range path {
-		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
-			return fmt.Errorf("Request.Path %q contains whitespace or a control character", path)
-		}
+	if !printableASCII(path) {
+		return fmt.Errorf("Request.Path %q contains a non-printable ASCII byte", path)
 	}
 	return nil
+}
+
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 func validateHeaderName(name string) error {
@@ -330,6 +343,9 @@ func validateHeaderName(name string) error {
 
 // validHeaderToken reports whether s is an RFC 7230 token (tchar only).
 func validHeaderToken(s string) bool {
+	if s == "" {
+		return false
+	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
@@ -345,11 +361,10 @@ func validHeaderToken(s string) bool {
 }
 
 func (e Expect) normalized() Expect {
-	out := Expect{
-		Status:        slices.Clone(e.Status),
-		BodyMustNot:   slices.Clone(e.BodyMustNot),
-		HeaderMustNot: slices.Clone(e.HeaderMustNot),
-	}
+	out := e
+	out.Status = slices.Clone(e.Status)
+	out.BodyMustNot = slices.Clone(e.BodyMustNot)
+	out.HeaderMustNot = slices.Clone(e.HeaderMustNot)
 	if len(out.Status) == 0 {
 		out.Status = []int{http.StatusForbidden}
 	}

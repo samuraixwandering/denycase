@@ -41,12 +41,14 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 - A 2xx or 5xx response fails the test.
 - 404 fails unless the case lists 404 in `Expect.Status`. There is no hide-existence helper yet; 403 vs 404 as an enumeration oracle is not tested.
 - If `BodyMustNot` is set, a deny that still contains a foreign field in the raw body fails (byte-exact). The same needles are checked in the *values* of Location, Content-Location, Content-Disposition, and Set-Cookie (headers and trailers). Those four are the only defaults. Every other response header is unscanned unless listed in `HeaderMustNot`.
-- `HeaderMustNot` is a list of header names, not needles. It requires `BodyMustNot`. Names must be RFC 7230 tokens. Header *names* on the response are never scanned; a leak that exists only as a name (`X-Tenant-A-Region`) is not expressible.
+- `HeaderMustNot` is a list of header names, not needles. It requires `BodyMustNot`. Names must be RFC 7230 tokens. Header *names* on the response are never scanned; a leak that exists only as a name (`X-Tenant-A-Region`) is not expressible. A listed name that is absent from the response is a no-op: the check does not run and the test does not fail.
 - An empty needle or empty / non-token `HeaderMustNot` name is invalid.
 - Byte-exact also applies to the four default headers. Percent-encoding (`tenant%2DA`), `filename*`, and `http.SetCookie` sanitizing are not decoded. Short needles can match structured values such as a `Set-Cookie` `Expires` date.
 - `httptest` and the HTTP server drop forbidden trailer names (`Content-Type`, `Cache-Control`, `Authorization`, …). Those are not scanned as trailers. The same name set via `http.TrailerPrefix` is scanned.
+- Header and trailer leaks are checked before the `Content-Encoding` gate, so a plaintext `Location` leak is reported even when the body is encoded.
 - If `BodyMustNot` is set and any `Content-Encoding` header value is present and not `identity`, the test fails. The library does not decode gzip. JSON `\u003c` / `\u003e` / `\u0026` are not unescaped; needles must match the bytes the handler wrote.
-- When `ApplyPrincipal` is nil, both `Principal.Tenant` and `Principal.ID` are required. A missing tenant header cannot pass as a BOLA deny.
+- `Principal.Tenant` and `Principal.ID` are always required, including when `ApplyPrincipal` is set. A missing tenant cannot pass as a BOLA deny.
+- `Request.Path` must be printable ASCII (bytes `0x21–0x7E`) so copy-pasted zero-width characters and request-line gadgets are rejected. `Request.Method` and `Request.Header` names must be RFC 7230 tokens. Request header *values* are not validated.
 
 ## Residual risk
 
@@ -55,4 +57,5 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 - An empty `Corpus` means authors must write their own cases until the fixture pack exists.
 - `Content-Encoding` is only read from the response header. A gzipped body with no header, or with `Content-Encoding` declared only as a trailer, is scanned as raw bytes and may miss a leak.
 - Only Location, Content-Location, Content-Disposition, and Set-Cookie are scanned by default. `ETag`, `Link`, `Refresh`, `WWW-Authenticate`, `X-Accel-Redirect`, `X-Owner`, and every other header are unscanned unless listed in `HeaderMustNot`.
-- A leak that exists only as a header name is not expressible. `HeaderMustNot` still only reads values.
+- A leak that exists only as a header name is not expressible. `HeaderMustNot` still only reads values. A typo in a listed name (`X-Ownr`, or a needle used as a name) scans nothing and the test stays green.
+- A handler panic is a failed test, not a silent allow. `MustDeny` does not recover: `testing` repanics, the process exits, later cases in the same run do not execute, and `Case.Name` is not in the output.
