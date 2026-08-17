@@ -7,6 +7,7 @@ package denycase
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,13 +25,14 @@ const (
 	HeaderPrincipal = "X-Denycase-Principal"
 )
 
-// leakHeaderNames are response headers whose values are scanned for BodyMustNot.
-// Content-Type and other stdlib defaults are not in this list.
-var leakHeaderNames = []string{
-	"Location",
-	"Content-Location",
-	"ETag",
-	"Link",
+// skipLeakHeaders are stdlib/noise headers whose names and values are not
+// scanned for BodyMustNot. Everything else (including X-Owner, Set-Cookie,
+// Content-Disposition) is scanned on both the header map and the trailer map.
+var skipLeakHeaders = map[string]struct{}{
+	"Content-Type":           {},
+	"Content-Length":         {},
+	"Date":                   {},
+	"X-Content-Type-Options": {},
 }
 
 // Kind names a shipped deny situation. The corpus itself is still empty.
@@ -58,9 +60,10 @@ type Request struct {
 
 // Expect is what a deny looks like. Empty Status defaults to 403.
 // Status may only be 403 or 404. BodyMustNot fails the test if any
-// substring appears in the raw response body, in the values of
-// Location / Content-Location / ETag / Link (headers or trailers),
-// or in any header or trailer name.
+// substring appears in the raw response body, or in a header/trailer
+// name or value other than Content-Type, Content-Length, Date, and
+// X-Content-Type-Options. Header/trailer names are compared without
+// regard to case; body and values are byte-exact.
 type Expect struct {
 	Status      []int
 	BodyMustNot []string
@@ -133,7 +136,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		return
 	}
 
-	if !containsStatus(exp.Status, res.StatusCode) {
+	if !slices.Contains(exp.Status, res.StatusCode) {
 		t.Fatalf("denycase: %s: status %d, want one of %v (fail closed)", c.Name, res.StatusCode, exp.Status)
 		return
 	}
@@ -152,7 +155,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 			t.Fatalf("denycase: %s: response leaked %q", c.Name, needle)
 			return
 		}
-		if leakContains(res.Header, res.Trailer, needle) {
+		if leakContains(res.Header, needle) || leakContains(res.Trailer, needle) {
 			t.Fatalf("denycase: %s: response header leaked %q", c.Name, needle)
 			return
 		}
@@ -188,39 +191,14 @@ func encodedBody(enc string) bool {
 	return enc != "" && !strings.EqualFold(enc, "identity")
 }
 
-func leakContains(headers, trailers http.Header, needle string) bool {
-	if namesContain(headers, needle) || namesContain(trailers, needle) {
-		return true
-	}
-	if valuesContain(trailers, needle) {
-		return true
-	}
-	for _, name := range leakHeaderNames {
-		for _, v := range headers.Values(name) {
-			if strings.Contains(v, needle) {
-				return true
-			}
+func leakContains(h http.Header, needle string) bool {
+	for name, vs := range h {
+		if skipLeak(name) {
+			continue
 		}
-		for _, v := range trailers.Values(name) {
-			if strings.Contains(v, needle) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func namesContain(h http.Header, needle string) bool {
-	for name := range h {
-		if strings.Contains(name, needle) {
+		if containsFold(name, needle) {
 			return true
 		}
-	}
-	return false
-}
-
-func valuesContain(h http.Header, needle string) bool {
-	for _, vs := range h {
 		for _, v := range vs {
 			if strings.Contains(v, needle) {
 				return true
@@ -230,9 +208,18 @@ func valuesContain(h http.Header, needle string) bool {
 	return false
 }
 
+func skipLeak(name string) bool {
+	_, ok := skipLeakHeaders[http.CanonicalHeaderKey(name)]
+	return ok
+}
+
+func containsFold(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
 func (c Case) validate() error {
 	if c.Name == "" {
-		return fmt.Errorf("Name is required")
+		return errors.New("Name is required")
 	}
 	if err := validateMethod(c.Request.Method); err != nil {
 		return err
@@ -245,11 +232,11 @@ func (c Case) validate() error {
 	}
 	if c.ApplyPrincipal == nil {
 		if c.Principal.Tenant == "" || c.Principal.ID == "" {
-			return fmt.Errorf("Principal.Tenant and Principal.ID are required when ApplyPrincipal is nil")
+			return errors.New("Principal.Tenant and Principal.ID are required when ApplyPrincipal is nil")
 		}
 	}
 	for _, s := range c.Expect.Status {
-		if !allowedDenyStatus(s) {
+		if s != http.StatusForbidden && s != http.StatusNotFound {
 			return fmt.Errorf("Expect.Status %d is not 403 or 404", s)
 		}
 	}
@@ -263,7 +250,7 @@ func validateRequestHeaders(h http.Header) error {
 	seen := make(map[string]string, len(h))
 	for k := range h {
 		can := http.CanonicalHeaderKey(k)
-		if prev, ok := seen[can]; ok && prev != k {
+		if prev, ok := seen[can]; ok {
 			return fmt.Errorf("Request.Header has duplicate keys %q and %q", prev, k)
 		}
 		seen[can] = k
@@ -271,13 +258,9 @@ func validateRequestHeaders(h http.Header) error {
 	return nil
 }
 
-func allowedDenyStatus(s int) bool {
-	return s == http.StatusForbidden || s == http.StatusNotFound
-}
-
 func validateMethod(method string) error {
 	if method == "" {
-		return fmt.Errorf("Request.Method is required")
+		return errors.New("Request.Method is required")
 	}
 	for _, r := range method {
 		if unicode.IsSpace(r) {
@@ -289,7 +272,7 @@ func validateMethod(method string) error {
 
 func validatePath(path string) error {
 	if path == "" {
-		return fmt.Errorf("Request.Path is required")
+		return errors.New("Request.Path is required")
 	}
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("Request.Path %q must start with /", path)
@@ -303,15 +286,7 @@ func (e Expect) normalized() Expect {
 		out.Status = []int{http.StatusForbidden}
 		return out
 	}
+	// Do not alias the caller's Status slice.
 	out.Status = slices.Clone(e.Status)
 	return out
-}
-
-func containsStatus(have []int, want int) bool {
-	for _, s := range have {
-		if s == want {
-			return true
-		}
-	}
-	return false
 }
