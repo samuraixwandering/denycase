@@ -2,7 +2,7 @@
 
 Fail-closed Go test helpers for multi-tenant BOLA/IDOR deny cases.
 
-You pass an `http.Handler` and a case that must be denied. If the handler allows the request (or leaks the other tenant's fields), the test fails. There is no network and no policy engine.
+You pass an `http.Handler` and a case that must be denied. If the handler allows the request, the test fails. `BodyMustNot` is optional: those bytes must not appear in the body or in Location, Content-Location, Content-Disposition, or Set-Cookie. Other response headers are not scanned unless you list their names in `HeaderMustNot`. There is no network and no policy engine.
 
 ```go
 denycase.MustDeny(t, denycase.Case{
@@ -15,7 +15,7 @@ denycase.MustDeny(t, denycase.Case{
 
 By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Principal`. Both fields are required on that path. Set `ApplyPrincipal` to match how your app actually authenticates.
 
-`BodyMustNot` is matched in the response body and in Location / Content-Location / Content-Disposition / Set-Cookie. Add `HeaderMustNot` for other headers (`X-Owner`, …).
+`BodyMustNot` is matched byte-exact in the response body and in the values of Location / Content-Location / Content-Disposition / Set-Cookie. `HeaderMustNot` is extra header *names* (not needles) to scan for those same bytes. It requires `BodyMustNot`. Percent-encoding is not decoded.
 
 v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
 
