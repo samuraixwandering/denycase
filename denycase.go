@@ -11,7 +11,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
+	"unicode"
 )
 
 const (
@@ -36,6 +39,10 @@ type Principal struct {
 	ID     string
 }
 
+func (p Principal) zero() bool {
+	return p.Tenant == "" && p.ID == ""
+}
+
 // Request is the HTTP call to run against the handler.
 type Request struct {
 	Method string
@@ -45,12 +52,12 @@ type Request struct {
 }
 
 // Expect is what a deny looks like. Empty Status defaults to 403.
-// HideExistence also accepts 404. BodyMustNot fails the test if any
-// substring appears in the response (foreign object fields, other tenant ids).
+// Only 4xx codes are allowed; 2xx and 5xx cannot be a deny.
+// BodyMustNot fails the test if any substring appears in the raw
+// response body or in any response header value.
 type Expect struct {
-	Status        []int
-	HideExistence bool
-	BodyMustNot   []string
+	Status      []int
+	BodyMustNot []string
 }
 
 // Denied is the default expect: HTTP 403.
@@ -97,10 +104,12 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 	if len(c.Request.Body) > 0 {
 		body = bytes.NewReader(c.Request.Body)
 	}
-	req := httptest.NewRequest(c.Request.Method, c.Request.Path, body)
-	if c.Request.Header != nil {
-		req.Header = c.Request.Header.Clone()
+	req, err := newTestRequest(c.Request.Method, c.Request.Path, body)
+	if err != nil {
+		t.Fatalf("denycase: %s: %v", c.Name, err)
+		return
 	}
+	copyHeaders(req.Header, c.Request.Header)
 	if c.ApplyPrincipal != nil {
 		c.ApplyPrincipal(req, c.Principal)
 	} else {
@@ -122,9 +131,37 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		return
 	}
 	for _, needle := range exp.BodyMustNot {
-		if needle != "" && bytes.Contains(got, []byte(needle)) {
+		if needle == "" {
+			t.Fatalf("denycase: %s: BodyMustNot contains an empty needle", c.Name)
+			return
+		}
+		if bytes.Contains(got, []byte(needle)) {
 			t.Fatalf("denycase: %s: response leaked %q", c.Name, needle)
 			return
+		}
+		if headerContains(res.Header, needle) {
+			t.Fatalf("denycase: %s: response header leaked %q", c.Name, needle)
+			return
+		}
+	}
+}
+
+func newTestRequest(method, path string, body io.Reader) (req *http.Request, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("invalid request %s %s: %v", method, path, rec)
+		}
+	}()
+	return httptest.NewRequest(method, path, body), nil
+}
+
+func copyHeaders(dst, src http.Header) {
+	if src == nil {
+		return
+	}
+	for k, vs := range src {
+		for _, v := range vs {
+			dst.Add(k, v)
 		}
 	}
 }
@@ -138,15 +175,56 @@ func applyDefaultPrincipal(req *http.Request, p Principal) {
 	}
 }
 
+func headerContains(h http.Header, needle string) bool {
+	for _, vs := range h {
+		for _, v := range vs {
+			if strings.Contains(v, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c Case) validate() error {
 	if c.Name == "" {
 		return fmt.Errorf("Name is required")
 	}
-	if c.Request.Method == "" {
+	if err := validateMethod(c.Request.Method); err != nil {
+		return err
+	}
+	if err := validatePath(c.Request.Path); err != nil {
+		return err
+	}
+	if c.ApplyPrincipal == nil && c.Principal.zero() {
+		return fmt.Errorf("Principal.Tenant or Principal.ID is required when ApplyPrincipal is nil")
+	}
+	for _, s := range c.Expect.Status {
+		if s < 400 || s > 499 {
+			return fmt.Errorf("Expect.Status %d is not 4xx", s)
+		}
+	}
+	return nil
+}
+
+func validateMethod(method string) error {
+	if method == "" {
 		return fmt.Errorf("Request.Method is required")
 	}
-	if c.Request.Path == "" {
+	for _, r := range method {
+		if unicode.IsSpace(r) {
+			return fmt.Errorf("Request.Method %q contains whitespace", method)
+		}
+	}
+	return nil
+}
+
+func validatePath(path string) error {
+	if path == "" {
 		return fmt.Errorf("Request.Path is required")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("Request.Path %q must start with /", path)
 	}
 	return nil
 }
@@ -155,10 +233,9 @@ func (e Expect) normalized() Expect {
 	out := e
 	if len(out.Status) == 0 {
 		out.Status = []int{http.StatusForbidden}
+		return out
 	}
-	if out.HideExistence && !containsStatus(out.Status, http.StatusNotFound) {
-		out.Status = append(out.Status, http.StatusNotFound)
-	}
+	out.Status = slices.Clone(e.Status)
 	return out
 }
 
