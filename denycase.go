@@ -25,14 +25,15 @@ const (
 	HeaderPrincipal = "X-Denycase-Principal"
 )
 
-// skipLeakHeaders are stdlib/noise headers whose names and values are not
-// scanned for BodyMustNot. Everything else (including X-Owner, Set-Cookie,
-// Content-Disposition) is scanned on both the header map and the trailer map.
-var skipLeakHeaders = map[string]struct{}{
-	"Content-Type":           {},
-	"Content-Length":         {},
-	"Date":                   {},
-	"X-Content-Type-Options": {},
+// defaultLeakHeaders are response headers whose values are always scanned
+// for BodyMustNot needles. They are specified to carry a resource identity
+// (redirect, filename, cookie). X-Owner and friends are not here; list
+// them in Expect.HeaderMustNot.
+var defaultLeakHeaders = []string{
+	"Location",
+	"Content-Location",
+	"Content-Disposition",
+	"Set-Cookie",
 }
 
 // Kind names a shipped deny situation. The corpus itself is still empty.
@@ -59,14 +60,16 @@ type Request struct {
 }
 
 // Expect is what a deny looks like. Empty Status defaults to 403.
-// Status may only be 403 or 404. BodyMustNot fails the test if any
-// substring appears in the raw response body, or in a header/trailer
-// name or value other than Content-Type, Content-Length, Date, and
-// X-Content-Type-Options. Header/trailer names are compared without
-// regard to case; body and values are byte-exact.
+// Status may only be 403 or 404.
+//
+// BodyMustNot is a list of substrings that must not appear in the raw
+// response body (byte-exact). The same needles are also checked in the
+// values of Location, Content-Location, Content-Disposition, and
+// Set-Cookie (headers and trailers), plus any names in HeaderMustNot.
 type Expect struct {
-	Status      []int
-	BodyMustNot []string
+	Status        []int
+	BodyMustNot   []string
+	HeaderMustNot []string
 }
 
 // Denied is the default expect: HTTP 403.
@@ -109,6 +112,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 	}
 
 	exp := c.Expect.normalized()
+	headerNames := leakNames(exp.HeaderMustNot)
 
 	var body io.Reader
 	if len(c.Request.Body) > 0 {
@@ -155,8 +159,12 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 			t.Fatalf("denycase: %s: response leaked %q", c.Name, needle)
 			return
 		}
-		if leakContains(res.Header, needle) || leakContains(res.Trailer, needle) {
+		if valuesContain(res.Header, headerNames, needle) {
 			t.Fatalf("denycase: %s: response header leaked %q", c.Name, needle)
+			return
+		}
+		if valuesContain(res.Trailer, headerNames, needle) {
+			t.Fatalf("denycase: %s: response trailer leaked %q", c.Name, needle)
 			return
 		}
 	}
@@ -191,30 +199,23 @@ func encodedBody(enc string) bool {
 	return enc != "" && !strings.EqualFold(enc, "identity")
 }
 
-func leakContains(h http.Header, needle string) bool {
-	for name, vs := range h {
-		if skipLeak(name) {
-			continue
-		}
-		if containsFold(name, needle) {
-			return true
-		}
-		for _, v := range vs {
+func leakNames(extra []string) []string {
+	names := append([]string(nil), defaultLeakHeaders...)
+	for _, n := range extra {
+		names = append(names, http.CanonicalHeaderKey(n))
+	}
+	return names
+}
+
+func valuesContain(h http.Header, names []string, needle string) bool {
+	for _, name := range names {
+		for _, v := range h.Values(name) {
 			if strings.Contains(v, needle) {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-func skipLeak(name string) bool {
-	_, ok := skipLeakHeaders[http.CanonicalHeaderKey(name)]
-	return ok
-}
-
-func containsFold(s, substr string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
 func (c Case) validate() error {
@@ -238,6 +239,11 @@ func (c Case) validate() error {
 	for _, s := range c.Expect.Status {
 		if s != http.StatusForbidden && s != http.StatusNotFound {
 			return fmt.Errorf("Expect.Status %d is not 403 or 404", s)
+		}
+	}
+	for _, name := range c.Expect.HeaderMustNot {
+		if name == "" {
+			return errors.New("HeaderMustNot contains an empty name")
 		}
 	}
 	return nil

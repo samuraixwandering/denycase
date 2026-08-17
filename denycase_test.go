@@ -126,14 +126,71 @@ func TestMustDenyFailsOnHeaderLeak(t *testing.T) {
 	}
 }
 
-func TestMustDenyFailsOnCustomHeaderValueLeak(t *testing.T) {
+func TestMustDenyIgnoresUnnamedCustomHeader(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Owner", "tenant-A")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	MustDeny(t, Case{
+		Name:      "x-owner not in scope",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+}
+
+func TestMustDenyFailsOnNamedCustomHeader(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Owner", "tenant-A")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	got := runMustDeny(t, Case{
-		Name:      "x-owner leak",
+		Name:      "x-owner named",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:        []int{http.StatusForbidden},
+			BodyMustNot:   []string{"tenant-A"},
+			HeaderMustNot: []string{"X-Owner"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response header leaked "tenant-A"`) {
+		t.Fatalf("want named X-Owner leak, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyIgnoresShortNeedleInMiddlewareHeaders(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=31536000")
+		w.Header().Set("X-Request-Id", "req-7f42ab")
+		w.Header().Set("Server", "nginx/1.21.4")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	MustDeny(t, Case{
+		Name:      "invoice 42",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/42"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"42"},
+		},
+	}, h)
+}
+
+func TestMustDenyFailsOnDispositionLeak(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="tenant-A-invoice.pdf"`)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "filename leak",
 		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
 		Expect: Expect{
@@ -142,63 +199,17 @@ func TestMustDenyFailsOnCustomHeaderValueLeak(t *testing.T) {
 		},
 	}, h)
 	if !got.failed || !strings.Contains(got.msg, `response header leaked "tenant-A"`) {
-		t.Fatalf("want X-Owner leak, got failed=%v msg=%q", got.failed, got.msg)
+		t.Fatalf("want Content-Disposition leak, got failed=%v msg=%q", got.failed, got.msg)
 	}
-}
-
-func TestMustDenyFailsOnHeaderNameLeak(t *testing.T) {
-	t.Parallel()
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("X-Owner-Tenant-A", "eu")
-		http.Error(w, "forbidden", http.StatusForbidden)
-	})
-	got := runMustDeny(t, Case{
-		Name:      "name leak",
-		Principal: Principal{Tenant: "B", ID: "user-b"},
-		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
-		Expect: Expect{
-			Status:      []int{http.StatusForbidden},
-			BodyMustNot: []string{"tenant-a"},
-		},
-	}, h)
-	if !got.failed || !strings.Contains(got.msg, `response header leaked "tenant-a"`) {
-		t.Fatalf("want case-insensitive name leak, got failed=%v msg=%q", got.failed, got.msg)
-	}
-}
-
-func TestMustDenyIgnoresShortNeedleInContentType(t *testing.T) {
-	t.Parallel()
-	MustDeny(t, Case{
-		Name:      "utf-8 is not a leak",
-		Principal: Principal{Tenant: "B", ID: "user-b"},
-		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
-		Expect: Expect{
-			Status:      []int{http.StatusForbidden},
-			BodyMustNot: []string{"8"},
-		},
-	}, http.HandlerFunc(denyOK))
-}
-
-func TestMustDenyIgnoresTypeNeedleInContentType(t *testing.T) {
-	t.Parallel()
-	MustDeny(t, Case{
-		Name:      "Type is not a leak",
-		Principal: Principal{Tenant: "B", ID: "user-b"},
-		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
-		Expect: Expect{
-			Status:      []int{http.StatusForbidden},
-			BodyMustNot: []string{"Type"},
-		},
-	}, http.HandlerFunc(denyOK))
 }
 
 func TestMustDenyFailsOnTrailerLeak(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Trailer", "X-Owner")
+		w.Header().Set("Trailer", "Location")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte("forbidden\n"))
-		w.Header().Set("X-Owner", "tenant-A")
+		w.Header().Set("Location", "/invoices/tenant-A")
 	})
 	got := runMustDeny(t, Case{
 		Name:      "trailer leak",
@@ -209,8 +220,24 @@ func TestMustDenyFailsOnTrailerLeak(t *testing.T) {
 			BodyMustNot: []string{"tenant-A"},
 		},
 	}, h)
-	if !got.failed || !strings.Contains(got.msg, `response header leaked "tenant-A"`) {
+	if !got.failed || !strings.Contains(got.msg, `response trailer leaked "tenant-A"`) {
 		t.Fatalf("want trailer leak, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsEmptyHeaderMustNot(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "empty header name",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:        []int{http.StatusForbidden},
+			HeaderMustNot: []string{""},
+		},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "HeaderMustNot") {
+		t.Fatalf("want empty HeaderMustNot validate, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 

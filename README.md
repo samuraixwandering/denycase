@@ -15,6 +15,8 @@ denycase.MustDeny(t, denycase.Case{
 
 By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Principal`. Both fields are required on that path. Set `ApplyPrincipal` to match how your app actually authenticates.
 
+`BodyMustNot` is matched in the response body and in Location / Content-Location / Content-Disposition / Set-Cookie. Add `HeaderMustNot` for other headers (`X-Owner`, …).
+
 v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
 
 ## Not this project
