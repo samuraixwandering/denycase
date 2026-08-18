@@ -1,6 +1,8 @@
 package denycase
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"net/http"
@@ -1128,15 +1130,19 @@ func TestMustDenyFailsOnLateDeletedContentEncoding(t *testing.T) {
 	}
 }
 
-func TestMustDenyEncodingGateSuppressesBodyScan(t *testing.T) {
+func TestMustDenyHonestGzipDoesNotReportBodyNeedle(t *testing.T) {
 	t.Parallel()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write([]byte(`{"owner":"tenant-A"}`))
+	_ = zw.Close()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write(append([]byte{0x1f, 0x8b}, []byte("tenant-A")...))
+		_, _ = w.Write(buf.Bytes())
 	})
 	got := runMustDeny(t, Case{
-		Name:      "gzip hides body",
+		Name:      "real gzip",
 		Principal: Principal{Tenant: "B", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
 		Expect: Expect{
@@ -1148,27 +1154,32 @@ func TestMustDenyEncodingGateSuppressesBodyScan(t *testing.T) {
 		t.Fatalf("want encoding gate, got failed=%v msg=%q", got.failed, got.msg)
 	}
 	if strings.Contains(got.msg, "response leaked") {
-		t.Fatalf("honest gzip should skip body scan: %q", got.msg)
+		t.Fatalf("real gzip must not contain a clear needle: %q", got.msg)
 	}
 }
 
-func TestMustDenyReportsBodyWhenGzipClaimIsPlaintext(t *testing.T) {
+func TestMustDenyReportsBodyWhenEncodingClaimIsPlaintext(t *testing.T) {
 	t.Parallel()
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Encoding", "gzip")
-		http.Error(w, `{"owner":"tenant-A"}`, http.StatusForbidden)
-	})
-	got := runMustDeny(t, Case{
-		Name:      "fake gzip",
-		Principal: Principal{Tenant: "B", ID: "user-b"},
-		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
-		Expect: Expect{
-			Status:      []int{http.StatusForbidden},
-			BodyMustNot: []string{"tenant-A"},
-		},
-	}, h)
-	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") || !strings.Contains(got.msg, `response leaked "tenant-A"`) {
-		t.Fatalf("want encoding and plaintext body leak, got failed=%v msg=%q", got.failed, got.msg)
+	for _, enc := range []string{"gzip", "br", "deflate", "zstd", "compress"} {
+		t.Run(enc, func(t *testing.T) {
+			t.Parallel()
+			h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Encoding", enc)
+				http.Error(w, `{"owner":"tenant-A"}`, http.StatusForbidden)
+			})
+			got := runMustDeny(t, Case{
+				Name:      "fake " + enc,
+				Principal: Principal{Tenant: "B", ID: "user-b"},
+				Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+				Expect: Expect{
+					Status:      []int{http.StatusForbidden},
+					BodyMustNot: []string{"tenant-A"},
+				},
+			}, h)
+			if !got.failed || !strings.Contains(got.msg, "Content-Encoding") || !strings.Contains(got.msg, `response leaked "tenant-A"`) {
+				t.Fatalf("want encoding and plaintext body leak, got failed=%v msg=%q", got.failed, got.msg)
+			}
+		})
 	}
 }
 
