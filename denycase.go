@@ -107,11 +107,10 @@ type Case struct {
 	Request   Request
 	Expect    Expect
 	// ApplyPrincipal writes the principal onto the request. If nil, denycase
-	// sets HeaderTenant and HeaderPrincipal. The callback must change
-	// Header, URL, Host, or Context. TLS, RemoteAddr, Form, and Body are
-	// not compared. Principal.Tenant and Principal.ID are always required.
-	// If Request.Header already has the value the callback would write,
-	// put that value in one place only.
+	// sets HeaderTenant and HeaderPrincipal. Only Header, URL, Host, and
+	// Context are compared; everything else is ignored. Principal.Tenant
+	// and Principal.ID are always required. If Request.Header already has
+	// the value the callback would write, put that value in one place only.
 	ApplyPrincipal func(*http.Request, Principal)
 }
 
@@ -137,7 +136,6 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 	}
 
 	exp := c.Expect.normalized()
-	headerNames := leakNames(exp.HeaderMustNot)
 
 	var body io.Reader
 	if len(c.Request.Body) > 0 {
@@ -153,7 +151,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		before := snapshotRequest(req)
 		c.ApplyPrincipal(req, c.Principal)
 		if !requestChanged(before, req) {
-			t.Fatalf("denycase: %q: ApplyPrincipal did not modify the request", c.Name)
+			t.Fatalf("denycase: %q: %s", c.Name, applyPrincipalUnchanged(before))
 			return
 		}
 	} else {
@@ -180,28 +178,32 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		return
 	}
 
-	trailers := declaredTrailers(res.Header, live, res.Trailer)
 	var findings []string
-	for _, needle := range exp.BodyMustNot {
-		if name, ok := headerLeaks(res.Header, trailers, headerNames, needle); ok {
-			findings = append(findings, fmt.Sprintf("response header %s leaked %q", name, needle))
-		}
-		if name, ok := trailerLeaks(live, res.Trailer, trailers, headerNames, needle); ok {
-			findings = append(findings, fmt.Sprintf("response trailer %s leaked %q", name, needle))
-		}
-	}
-	encoded := false
 	if len(exp.BodyMustNot) > 0 {
-		if msg, ok := encodingProblem(res.Header, res.Trailer); ok {
-			findings = append(findings, msg)
-			encoded = true
-		}
-	}
-	if !encoded {
-		for _, needle := range exp.BodyMustNot {
-			if bytes.Contains(got, []byte(needle)) {
-				findings = append(findings, fmt.Sprintf("response leaked %q", needle))
+		encMsg, encoded := encodingProblem(res.Header, live, res.Trailer)
+		if !encoded {
+			for _, needle := range exp.BodyMustNot {
+				if bytes.Contains(got, []byte(needle)) {
+					findings = append(findings, fmt.Sprintf("response leaked %q", needle))
+				}
 			}
+		}
+		headerNames := leakNames(exp.HeaderMustNot)
+		trailers := declaredTrailers(res.Header, live)
+		for _, needle := range exp.BodyMustNot {
+			hdr, hok := headerLeaks(res.Header, headerNames, needle)
+			trl, tok := trailerLeaks(live, res.Trailer, trailers, headerNames, needle)
+			if hok {
+				findings = append(findings, fmt.Sprintf("response header %s leaked %q", hdr, needle))
+				trl = dropNamedIn(trl, hdr)
+				tok = trl != ""
+			}
+			if tok {
+				findings = append(findings, fmt.Sprintf("response trailer %s leaked %q", trl, needle))
+			}
+		}
+		if encoded {
+			findings = append(findings, encMsg)
 		}
 	}
 	if len(findings) > 0 {
@@ -273,7 +275,15 @@ func headerEqual(a, b http.Header) bool {
 	return maps.EqualFunc(a, b, slices.Equal[[]string])
 }
 
-func encodingProblem(header, trailer http.Header) (string, bool) {
+func applyPrincipalUnchanged(before requestSnapshot) string {
+	msg := "ApplyPrincipal did not change Header, URL, Host, or Context"
+	if len(before.header) > 0 {
+		return msg + " (request already had these header values)"
+	}
+	return msg
+}
+
+func encodingProblem(header, live, trailer http.Header) (string, bool) {
 	var parts []string
 	if v, ok := nonIdentityContentEncoding(header); ok {
 		parts = append(parts, fmt.Sprintf("Content-Encoding is %q", v))
@@ -281,13 +291,38 @@ func encodingProblem(header, trailer http.Header) (string, bool) {
 	if v, ok := compressedTransferEncoding(header); ok {
 		parts = append(parts, fmt.Sprintf("Transfer-Encoding is %q", v))
 	}
-	if v, ok := nonIdentityContentEncoding(trailer); ok {
+	if v, ok := trailerContentEncoding(live, trailer); ok {
 		parts = append(parts, fmt.Sprintf("trailer Content-Encoding is %q", v))
 	}
 	if len(parts) == 0 {
 		return "", false
 	}
 	return "BodyMustNot set but " + strings.Join(parts, " and "), true
+}
+
+func trailerContentEncoding(live, trailer http.Header) (string, bool) {
+	var found []string
+	collectCE := func(k string, vs []string) {
+		if leakKey(k) != "Content-Encoding" {
+			return
+		}
+		for _, v := range vs {
+			for _, part := range splitHeaderList(v) {
+				if !strings.EqualFold(part, "identity") {
+					found = append(found, part)
+				}
+			}
+		}
+	}
+	for k, vs := range trailer {
+		collectCE(k, vs)
+	}
+	for k, vs := range live {
+		if hasTrailerPrefix(k) {
+			collectCE(k, vs)
+		}
+	}
+	return joinUnique(found)
 }
 
 func nonIdentityContentEncoding(h http.Header) (string, bool) {
@@ -371,7 +406,7 @@ func leakKey(k string) string {
 	return http.CanonicalHeaderKey(k)
 }
 
-func declaredTrailers(wire, live, result http.Header) map[string]struct{} {
+func declaredTrailers(wire, live http.Header) map[string]struct{} {
 	out := make(map[string]struct{})
 	addDecl := func(h http.Header) {
 		for k, vs := range h {
@@ -387,9 +422,6 @@ func declaredTrailers(wire, live, result http.Header) map[string]struct{} {
 	}
 	addDecl(wire)
 	addDecl(live)
-	for k := range result {
-		out[leakKey(k)] = struct{}{}
-	}
 	for k := range live {
 		if hasTrailerPrefix(k) {
 			out[leakKey(k)] = struct{}{}
@@ -407,15 +439,7 @@ func containsNeedle(vs []string, needle string) bool {
 	return false
 }
 
-func joinHits(hits []string) (string, bool) {
-	if len(hits) == 0 {
-		return "", false
-	}
-	slices.Sort(hits)
-	return strings.Join(hits, ", "), true
-}
-
-func headerLeaks(wire http.Header, trailers map[string]struct{}, names []string, needle string) (string, bool) {
+func headerLeaks(wire http.Header, names []string, needle string) (string, bool) {
 	want := leakWant(names)
 	var hits []string
 	for k, vs := range wire {
@@ -423,14 +447,11 @@ func headerLeaks(wire http.Header, trailers map[string]struct{}, names []string,
 		if _, ok := want[can]; !ok {
 			continue
 		}
-		if _, skip := trailers[can]; skip {
-			continue
-		}
 		if containsNeedle(vs, needle) {
 			hits = append(hits, k)
 		}
 	}
-	return joinHits(hits)
+	return joinUnique(hits)
 }
 
 func trailerLeaks(live, result http.Header, trailers map[string]struct{}, names []string, needle string) (string, bool) {
@@ -447,14 +468,13 @@ func trailerLeaks(live, result http.Header, trailers map[string]struct{}, names 
 		if !containsNeedle(vs, needle) {
 			return
 		}
-		if _, ok := seen[can]; ok {
-			return
-		}
 		display := k
 		if hasTrailerPrefix(k) {
 			display = k[len(trailerPrefix):]
 		}
-		seen[can] = display
+		if prev, ok := seen[can]; !ok || display < prev {
+			seen[can] = display
+		}
 	}
 	for k, vs := range result {
 		consider(k, vs)
@@ -466,7 +486,24 @@ func trailerLeaks(live, result http.Header, trailers map[string]struct{}, names 
 	for _, d := range seen {
 		hits = append(hits, d)
 	}
-	return joinHits(hits)
+	return joinUnique(hits)
+}
+
+func dropNamedIn(trl, hdr string) string {
+	if trl == "" || hdr == "" {
+		return trl
+	}
+	have := make(map[string]struct{})
+	for _, p := range strings.Split(hdr, ", ") {
+		have[leakKey(p)] = struct{}{}
+	}
+	var keep []string
+	for _, p := range strings.Split(trl, ", ") {
+		if _, ok := have[leakKey(p)]; !ok {
+			keep = append(keep, p)
+		}
+	}
+	return strings.Join(keep, ", ")
 }
 
 func formatFindings(findings []string) string {
@@ -580,16 +617,20 @@ func validatePath(path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("Request.Path %q must start with /", path)
 	}
-	return rejectHiddenText("Request.Path", path)
+	return rejectHiddenText("Request.Path", path, true)
 }
 
 func validatePrincipalValue(field, v string) error {
-	return rejectHiddenText("Principal."+field, v)
+	if strings.TrimSpace(v) != v {
+		return fmt.Errorf("Principal.%s %q has leading or trailing whitespace", field, v)
+	}
+	return rejectHiddenText("Principal."+field, v, false)
 }
 
-func rejectHiddenText(what, s string) error {
+func rejectHiddenText(what, s string, rejectSpace bool) error {
 	for i := 0; i < len(s); i++ {
-		if s[i] <= 0x20 || s[i] == 0x7f {
+		c := s[i]
+		if c == 0x7f || c < 0x20 || (rejectSpace && c <= 0x20) {
 			return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 		}
 	}
@@ -597,11 +638,24 @@ func rejectHiddenText(what, s string) error {
 		return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 	}
 	for _, r := range s {
-		if !unicode.IsPrint(r) || r == '\u115F' || r == '\u3164' || r == '\uFFA0' {
+		if hiddenRune(r) {
 			return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 		}
 	}
 	return nil
+}
+
+func hiddenRune(r rune) bool {
+	if !unicode.IsPrint(r) {
+		return true
+	}
+	if unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r) {
+		return true
+	}
+	if unicode.Is(unicode.Variation_Selector, r) {
+		return true
+	}
+	return r == '\u2800'
 }
 
 func validateHeaderName(name string) error {

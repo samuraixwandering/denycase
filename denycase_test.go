@@ -391,7 +391,7 @@ func TestMustDenyRejectsNoopApplyPrincipal(t *testing.T) {
 		ApplyPrincipal: func(*http.Request, Principal) {
 		},
 	}, http.HandlerFunc(denyOK))
-	if !got.failed || !strings.Contains(got.msg, "ApplyPrincipal did not modify the request") {
+	if !got.failed || !strings.Contains(got.msg, "did not change Header, URL, Host, or Context") {
 		t.Fatalf("want no-op ApplyPrincipal reject, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
@@ -407,7 +407,7 @@ func TestMustDenyRejectsApplyPrincipalLocalCopy(t *testing.T) {
 			c.Header.Set("Authorization", "Bearer "+p.ID)
 		},
 	}, http.HandlerFunc(denyOK))
-	if !got.failed || !strings.Contains(got.msg, "ApplyPrincipal did not modify the request") {
+	if !got.failed || !strings.Contains(got.msg, "did not change Header, URL, Host, or Context") {
 		t.Fatalf("want local-copy ApplyPrincipal reject, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
@@ -524,6 +524,9 @@ func TestMustDenyRejectsNonPrintablePath(t *testing.T) {
 		{"invalid-utf8", "/invoices/42\x85"},
 		{"nel", "/invoices/42\u0085"},
 		{"nbsp", "/invoices/\u00a0a"},
+		{"braille", "/invoices/42\u2800"},
+		{"jungseong", "/invoices/42\u1160"},
+		{"cgj", "/invoices/42\u034f"},
 		{"crlf", "/a HTTP/1.0\r\nX-Injected: yes\r\n\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -784,6 +787,7 @@ func TestMustDenyReportsSortedHeaderLeaks(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "/invoices/tenant-A")
 		w.Header().Set("Content-Location", "/invoices/tenant-A")
+		w.Header().Set("Set-Cookie", "owner=tenant-A")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	got := runMustDeny(t, Case{
@@ -795,7 +799,7 @@ func TestMustDenyReportsSortedHeaderLeaks(t *testing.T) {
 			BodyMustNot: []string{"tenant-A"},
 		},
 	}, h)
-	if !got.failed || !strings.Contains(got.msg, `response header Content-Location, Location leaked "tenant-A"`) {
+	if !got.failed || !strings.Contains(got.msg, `response header Content-Location, Location, Set-Cookie leaked "tenant-A"`) {
 		t.Fatalf("want sorted header names, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
@@ -1207,7 +1211,7 @@ func TestMustDenyRejectsTrailingSpacePrincipal(t *testing.T) {
 		Principal: Principal{Tenant: "B ", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
 	}, http.HandlerFunc(denyOK))
-	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant") || !strings.Contains(got.msg, "invisible character") {
+	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant") || !strings.Contains(got.msg, "leading or trailing whitespace") {
 		t.Fatalf("want trailing-space principal reject, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
@@ -1216,7 +1220,7 @@ func TestMustDenyRejectsNBSPPrincipal(t *testing.T) {
 	t.Parallel()
 	got := runMustDeny(t, Case{
 		Name:      "nbsp tenant",
-		Principal: Principal{Tenant: "B\u00a0", ID: "user-b"},
+		Principal: Principal{Tenant: "B\u00a0x", ID: "user-b"},
 		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
 	}, http.HandlerFunc(denyOK))
 	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant") || !strings.Contains(got.msg, "invisible character") {
@@ -1297,6 +1301,291 @@ func TestMustDenyAcceptsAllRFC9110Methods(t *testing.T) {
 				Request:   Request{Method: method, Path: "/invoices/a"},
 			}, http.HandlerFunc(denyOK))
 		})
+	}
+}
+
+func TestMustDenyFailsOnDeclaredLocationBeforeWrite(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "Location")
+		w.Header().Set("Location", "/invoices/tenant-A")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "declared wire",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response header Location leaked "tenant-A"`) {
+		t.Fatalf("want wire Location, got failed=%v msg=%q", got.failed, got.msg)
+	}
+	if strings.Contains(got.msg, "response trailer") {
+		t.Fatalf("same-name trailer should be suppressed: %q", got.msg)
+	}
+}
+
+func TestMustDenyFailsOnDeclaredLocationThenLateDel(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/x/tenant-A")
+		w.Header().Set("Trailer", "Location")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden\n"))
+		w.Header().Del("Location")
+	})
+	got := runMustDeny(t, Case{
+		Name:      "late del declared",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response header Location leaked "tenant-A"`) {
+		t.Fatalf("want snapshot Location after late Del, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyFailsOnPostCommitTrailerDeclaration(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/x/tenant-A")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden\n"))
+		w.Header().Del("Location")
+		w.Header().Set("Trailer", "Location")
+	})
+	got := runMustDeny(t, Case{
+		Name:      "late trailer decl",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response header Location leaked "tenant-A"`) {
+		t.Fatalf("want wire Location despite late Trailer, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyFailsOnForbiddenTrailerNameAsHeader(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "Cache-Control")
+		w.Header().Set("Cache-Control", "private, x-tenant-A")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "cc header",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:        []int{http.StatusForbidden},
+			BodyMustNot:   []string{"tenant-A"},
+			HeaderMustNot: []string{"Cache-Control"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response header Cache-Control leaked "tenant-A"`) {
+		t.Fatalf("want Cache-Control header leak, got failed=%v msg=%q", got.failed, got.msg)
+	}
+	if strings.Contains(got.msg, "response trailer") {
+		t.Fatalf("forbidden trailer name should not be labelled trailer: %q", got.msg)
+	}
+}
+
+func TestMustDenyIgnoresCleanDefaultHeaders(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/login")
+		w.Header().Set("Set-Cookie", "sid=abc; Path=/")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "no needle",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if got.failed {
+		t.Fatalf("clean Location/Set-Cookie should pass, got msg=%q", got.msg)
+	}
+}
+
+func TestMustDenyFailsOnMixedCaseTrailerPrefix(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden\n"))
+		w.Header()["TRAILER:location"] = []string{"/x/tenant-A"}
+	})
+	got := runMustDeny(t, Case{
+		Name:      "TRAILER prefix",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `response trailer`) || !strings.Contains(got.msg, `leaked "tenant-A"`) {
+		t.Fatalf("want TRAILER:location leak, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsPrefixedTrailerGzip(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["TRAILER:Content-Encoding"] = []string{"gzip"}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "lc trailer ce",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") {
+		t.Fatalf("want trailer:content-encoding gate, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyAcceptsSpacedPrincipal(t *testing.T) {
+	t.Parallel()
+	MustDeny(t, Case{
+		Name:      "acme",
+		Principal: Principal{Tenant: "Acme Corp", ID: "user b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+	}, http.HandlerFunc(denyOK))
+}
+
+func TestMustDenyApplyPrincipalAlreadyHadValue(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "preset same",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request: Request{
+			Method: http.MethodGet,
+			Path:   "/invoices/a",
+			Header: http.Header{"Authorization": []string{"Bearer user-b"}},
+		},
+		ApplyPrincipal: func(r *http.Request, p Principal) {
+			r.Header.Set("Authorization", "Bearer "+p.ID)
+		},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "already had these header values") {
+		t.Fatalf("want already-had-value message, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyPassesTransferEncodingIdentity(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Transfer-Encoding", "identity")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	MustDeny(t, Case{
+		Name:      "te identity",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+}
+
+func TestMustDenyDedupsEncodingTokens(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip, gzip")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "dup gzip",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `Content-Encoding is "gzip"`) || strings.Contains(got.msg, "gzip, gzip") {
+		t.Fatalf("want deduped gzip, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenySortsEncodingTokens(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip, br")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "sort enc",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, `Content-Encoding is "br, gzip"`) {
+		t.Fatalf("want sorted encodings, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyCapsFindings(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "n1 n2 n3 n4 n5 n6 n7 n8 n9", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "many needles",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "and 1 more") {
+		t.Fatalf("want findings cap, got failed=%v msg=%q", got.failed, got.msg)
+	}
+	if strings.Contains(got.msg, `leaked "n9"`) {
+		t.Fatalf("ninth body leak should be elided: %q", got.msg)
+	}
+}
+
+func TestMustDenyRejectsTwoDuplicateHeaderGroups(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "two dups",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request: Request{
+			Method: http.MethodGet,
+			Path:   "/invoices/a",
+			Header: http.Header{
+				"X-Owner":  []string{"a"},
+				"x-owner":  []string{"b"},
+				"X-Tenant": []string{"c"},
+				"x-tenant": []string{"d"},
+			},
+		},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "X-Owner") || !strings.Contains(got.msg, "X-Tenant") {
+		t.Fatalf("want both duplicate groups, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 

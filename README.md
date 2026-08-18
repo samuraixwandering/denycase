@@ -17,7 +17,7 @@ By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Prin
 
 `BodyMustNot` is matched byte-exact in the response body and in the values of Location / Content-Location / Content-Disposition / Set-Cookie. `HeaderMustNot` is extra header *names* (not needles) to scan for those same bytes. It requires `BodyMustNot`. A listed name that is not on the response is a no-op. Percent-encoding is not decoded.
 
-`Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes (NBSP, NEL), and a few invisible letter fillers are rejected. Encode spaces as `%20`.
+`Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. Encode spaces as `%20`. A principal may contain internal spaces (`Acme Corp`).
 
 v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
 
@@ -29,14 +29,16 @@ These used to be valid cases and now fail:
 - `ApplyPrincipal` set and a zero or blank `Principal`
 - `ApplyPrincipal` that does not change Header, URL, Host, or Context
 - `Request.Method` that is not an RFC 9110 method (`get`, `GETT`, WebDAV, …)
-- `Request.Path` or `Principal` containing a space, control, or invisible character
+- `Request.Path` containing a space, control, or invisible character; `Principal` with leading/trailing whitespace or an invisible rune
 - `Request.Header` names that are not RFC 7230 tokens
 - `BodyMustNot` set with a non-identity `Content-Encoding` or a non-`chunked`/`identity` `Transfer-Encoding`
 
 These used to fail and now pass unless you list the header in `HeaderMustNot`:
 
-- A leak only in `ETag` or `Link` (dropped from the default scan list)
+- A leak only in `ETag`, `Link`, `Refresh`, `WWW-Authenticate`, or `X-Accel-Redirect` (not in the default scan list)
 - A leak only in a response header *name* (names are never scanned)
+- A case-folded leak (`TENANT-A` vs needle `tenant-A`); matching is byte-exact
+- A header set after `WriteHeader` with no `Trailer` declaration (not on the wire)
 
 ## Not this project
 
