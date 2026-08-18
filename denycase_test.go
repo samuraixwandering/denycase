@@ -1153,6 +1153,7 @@ func TestMustDenyHonestGzipDoesNotReportBodyNeedle(t *testing.T) {
 	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") {
 		t.Fatalf("want encoding gate, got failed=%v msg=%q", got.failed, got.msg)
 	}
+	// We do not decode, so a real gzip body must not yield a clear needle.
 	if strings.Contains(got.msg, "response leaked") {
 		t.Fatalf("real gzip must not contain a clear needle: %q", got.msg)
 	}

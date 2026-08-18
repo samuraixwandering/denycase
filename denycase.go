@@ -475,6 +475,8 @@ func headerLeaks(wire http.Header, want map[string]struct{}, needle string) (str
 	return joinUnique(hits)
 }
 
+// trailerLeaks walks live and result the same way. The two Header
+// arguments (and the two maps) are interchangeable today.
 func trailerLeaks(live http.Header, want map[string]struct{}, result http.Header, trailers map[string]struct{}, needle string) (string, bool) {
 	seen := make(map[string]string)
 	consider := func(k string, vs []string) {
