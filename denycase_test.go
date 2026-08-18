@@ -527,6 +527,8 @@ func TestMustDenyRejectsNonPrintablePath(t *testing.T) {
 		{"braille", "/invoices/42\u2800"},
 		{"jungseong", "/invoices/42\u1160"},
 		{"cgj", "/invoices/42\u034f"},
+		{"vs16", "/invoices/42\ufe0f"},
+		{"vs-supp", "/invoices/42\U000e0100"},
 		{"crlf", "/a HTTP/1.0\r\nX-Injected: yes\r\n\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -761,7 +763,7 @@ func TestMustDenyRejectsNonCanonicalGzip(t *testing.T) {
 	}
 }
 
-func TestMustDenyReportsHeaderLeakBeforeEncodingGate(t *testing.T) {
+func TestMustDenyReportsHeaderLeakAlongsideEncodingGate(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
@@ -777,8 +779,10 @@ func TestMustDenyReportsHeaderLeakBeforeEncodingGate(t *testing.T) {
 			BodyMustNot: []string{"tenant-A"},
 		},
 	}, h)
-	if !got.failed || !strings.Contains(got.msg, `response header Location leaked "tenant-A"`) {
-		t.Fatalf("want Location leak before encoding gate, got failed=%v msg=%q", got.failed, got.msg)
+	enc := strings.Index(got.msg, "Content-Encoding")
+	loc := strings.Index(got.msg, `response header Location leaked "tenant-A"`)
+	if !got.failed || enc < 0 || loc < 0 || enc > loc {
+		t.Fatalf("want encoding then Location, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
@@ -1128,7 +1132,8 @@ func TestMustDenyEncodingGateSuppressesBodyScan(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
-		http.Error(w, `{"owner":"tenant-A"}`, http.StatusForbidden)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write(append([]byte{0x1f, 0x8b}, []byte("tenant-A")...))
 	})
 	got := runMustDeny(t, Case{
 		Name:      "gzip hides body",
@@ -1143,7 +1148,27 @@ func TestMustDenyEncodingGateSuppressesBodyScan(t *testing.T) {
 		t.Fatalf("want encoding gate, got failed=%v msg=%q", got.failed, got.msg)
 	}
 	if strings.Contains(got.msg, "response leaked") {
-		t.Fatalf("body scan should be suppressed: %q", got.msg)
+		t.Fatalf("honest gzip should skip body scan: %q", got.msg)
+	}
+}
+
+func TestMustDenyReportsBodyWhenGzipClaimIsPlaintext(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		http.Error(w, `{"owner":"tenant-A"}`, http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "fake gzip",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") || !strings.Contains(got.msg, `response leaked "tenant-A"`) {
+		t.Fatalf("want encoding and plaintext body leak, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
@@ -1225,6 +1250,18 @@ func TestMustDenyRejectsNBSPPrincipal(t *testing.T) {
 	}, http.HandlerFunc(denyOK))
 	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant") || !strings.Contains(got.msg, "invisible character") {
 		t.Fatalf("want NBSP principal reject, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsVariationSelectorPrincipal(t *testing.T) {
+	t.Parallel()
+	got := runMustDeny(t, Case{
+		Name:      "vs tenant",
+		Principal: Principal{Tenant: "B\ufe0f", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+	}, http.HandlerFunc(denyOK))
+	if !got.failed || !strings.Contains(got.msg, "Principal.Tenant") || !strings.Contains(got.msg, "invisible character") {
+		t.Fatalf("want VS principal reject, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
@@ -1444,7 +1481,7 @@ func TestMustDenyFailsOnMixedCaseTrailerPrefix(t *testing.T) {
 func TestMustDenyRejectsPrefixedTrailerGzip(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header()["TRAILER:Content-Encoding"] = []string{"gzip"}
+		w.Header().Set(http.TrailerPrefix+"Content-Encoding", "gzip")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	got := runMustDeny(t, Case{
@@ -1585,15 +1622,18 @@ func TestMustDenyCapsFindingsKeepsEncoding(t *testing.T) {
 			BodyMustNot: needles,
 		},
 	}, h)
-	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") {
+	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") || !strings.Contains(got.msg, "and 3 more") {
 		t.Fatalf("want encoding line under cap, got failed=%v msg=%q", got.failed, got.msg)
+	}
+	if strings.Contains(got.msg, `leaked "j-tenant"`) {
+		t.Fatalf("elided header leak should be absent: %q", got.msg)
 	}
 }
 
 func TestMustDenyRejectsPrefixedTrailerTransferEncoding(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header()["trailer:transfer-encoding"] = []string{"gzip"}
+		w.Header().Set(http.TrailerPrefix+"Transfer-Encoding", "gzip")
 		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	got := runMustDeny(t, Case{
@@ -1608,6 +1648,23 @@ func TestMustDenyRejectsPrefixedTrailerTransferEncoding(t *testing.T) {
 	if !got.failed || !strings.Contains(got.msg, "Transfer-Encoding") {
 		t.Fatalf("want trailer Transfer-Encoding gate, got failed=%v msg=%q", got.failed, got.msg)
 	}
+}
+
+func TestMustDenyPassesTrailerTransferEncodingIdentity(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(http.TrailerPrefix+"Transfer-Encoding", "identity")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	MustDeny(t, Case{
+		Name:      "trailer te identity",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
 }
 
 func TestMustDenyRejectsTwoDuplicateHeaderGroups(t *testing.T) {

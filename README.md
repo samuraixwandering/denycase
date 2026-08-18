@@ -17,7 +17,7 @@ By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Prin
 
 `BodyMustNot` is matched byte-exact in the response body and in the values of Location / Content-Location / Content-Disposition / Set-Cookie. `HeaderMustNot` is extra header *names* (not needles) to scan for those same bytes. It requires `BodyMustNot`. A listed name that is not on the response is a no-op. Percent-encoding is not decoded.
 
-`Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. That includes ZERO WIDTH JOINER, so multi-person emoji sequences are rejected even when the rest of the path is valid; percent-encode them. A principal may contain internal spaces (`Acme Corp`).
+`Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. That includes ZERO WIDTH JOINER and variation selectors (U+FE0F), so multi-person emoji and the ordinary emoji-style heart (U+2764 U+FE0F) are rejected even when the rest of the path is valid; percent-encode them. A principal may contain internal spaces (`Acme Corp`).
 
 v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
 

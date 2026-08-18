@@ -151,7 +151,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		before := snapshotRequest(req)
 		c.ApplyPrincipal(req, c.Principal)
 		if !requestChanged(before, req) {
-			t.Fatalf("denycase: %q: %s", c.Name, applyPrincipalUnchanged())
+			t.Fatalf("denycase: %q: %s", c.Name, applyPrincipalUnchangedMsg)
 			return
 		}
 	} else {
@@ -183,7 +183,8 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		encMsg, encoded := encodingProblem(res.Header, live, res.Trailer)
 		if encoded {
 			findings = append(findings, encMsg)
-		} else {
+		}
+		if !encoded || (claimedGzip(res.Header, live, res.Trailer) && !bytes.HasPrefix(got, gzipMagic)) {
 			for _, needle := range exp.BodyMustNot {
 				if bytes.Contains(got, []byte(needle)) {
 					findings = append(findings, fmt.Sprintf("response leaked %q", needle))
@@ -191,10 +192,11 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 			}
 		}
 		headerNames := leakNames(exp.HeaderMustNot)
+		want := leakWant(headerNames)
 		trailers := declaredTrailers(res.Header, live)
 		for _, needle := range exp.BodyMustNot {
-			hdr, hok := headerLeaks(res.Header, headerNames, needle)
-			trl, tok := trailerLeaks(live, res.Trailer, trailers, headerNames, needle)
+			hdr, hok := headerLeaks(res.Header, want, needle)
+			trl, tok := trailerLeaks(live, res.Trailer, trailers, want, needle)
 			if hok {
 				findings = append(findings, fmt.Sprintf("response header %s leaked %q", hdr, needle))
 				trl = dropNamedIn(trl, hdr)
@@ -274,9 +276,9 @@ func headerEqual(a, b http.Header) bool {
 	return maps.EqualFunc(a, b, slices.Equal[[]string])
 }
 
-func applyPrincipalUnchanged() string {
-	return "ApplyPrincipal did not change Header, URL, Host, or Context (if your callback writes a value Request.Header already has, put it in one place only)"
-}
+const applyPrincipalUnchangedMsg = "ApplyPrincipal did not change Header, URL, Host, or Context (if your callback writes a value Request.Header already has, put it in one place only; writing to a cloned request is also a no-op)"
+
+var gzipMagic = []byte{0x1f, 0x8b}
 
 func encodingProblem(header, live, trailer http.Header) (string, bool) {
 	var parts []string
@@ -296,6 +298,48 @@ func encodingProblem(header, live, trailer http.Header) (string, bool) {
 		return "", false
 	}
 	return "BodyMustNot set but " + strings.Join(parts, " and "), true
+}
+
+func claimedGzip(header, live, trailer http.Header) bool {
+	if headerHasGzip(header) {
+		return true
+	}
+	if headerHasGzip(trailer) {
+		return true
+	}
+	for k, vs := range live {
+		if hasTrailerPrefix(k) && (leakKey(k) == "Content-Encoding" || leakKey(k) == "Transfer-Encoding") {
+			if tokensIncludeGzip(vs) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func headerHasGzip(h http.Header) bool {
+	for k, vs := range h {
+		can := leakKey(k)
+		if can != "Content-Encoding" && can != "Transfer-Encoding" {
+			continue
+		}
+		if tokensIncludeGzip(vs) {
+			return true
+		}
+	}
+	return false
+}
+
+func tokensIncludeGzip(vs []string) bool {
+	for _, v := range vs {
+		for _, part := range splitHeaderList(v) {
+			low := strings.ToLower(part)
+			if low == "gzip" || low == "x-gzip" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func trailerContentEncoding(live, trailer http.Header) (string, bool) {
@@ -463,8 +507,7 @@ func containsNeedle(vs []string, needle string) bool {
 	return false
 }
 
-func headerLeaks(wire http.Header, names []string, needle string) (string, bool) {
-	want := leakWant(names)
+func headerLeaks(wire http.Header, want map[string]struct{}, needle string) (string, bool) {
 	var hits []string
 	for k, vs := range wire {
 		can := leakKey(k)
@@ -478,8 +521,7 @@ func headerLeaks(wire http.Header, names []string, needle string) (string, bool)
 	return joinUnique(hits)
 }
 
-func trailerLeaks(live, result http.Header, trailers map[string]struct{}, names []string, needle string) (string, bool) {
-	want := leakWant(names)
+func trailerLeaks(live, result http.Header, trailers, want map[string]struct{}, needle string) (string, bool) {
 	seen := make(map[string]string)
 	consider := func(k string, vs []string) {
 		can := leakKey(k)
