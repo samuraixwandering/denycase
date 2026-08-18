@@ -7,6 +7,7 @@ package denycase
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -33,6 +36,27 @@ var defaultLeakHeaders = []string{
 	"Content-Location",
 	"Content-Disposition",
 	"Set-Cookie",
+}
+
+// rfc9110Methods is the RFC 9110 method set, case-sensitive.
+var rfc9110Methods = map[string]struct{}{
+	http.MethodGet:     {},
+	http.MethodHead:    {},
+	http.MethodPost:    {},
+	http.MethodPut:     {},
+	http.MethodDelete:  {},
+	http.MethodConnect: {},
+	http.MethodOptions: {},
+	http.MethodTrace:   {},
+	http.MethodPatch:   {},
+}
+
+var compressedTE = map[string]struct{}{
+	"gzip":     {},
+	"deflate":  {},
+	"compress": {},
+	"br":       {},
+	"zstd":     {},
 }
 
 // Kind names a shipped deny situation. The corpus itself is still empty.
@@ -86,7 +110,8 @@ type Case struct {
 	Request   Request
 	Expect    Expect
 	// ApplyPrincipal writes the principal onto the request. If nil, denycase
-	// sets HeaderTenant and HeaderPrincipal. Principal.Tenant and
+	// sets HeaderTenant and HeaderPrincipal. The callback must modify the
+	// request (headers, URL, Host, or Context). Principal.Tenant and
 	// Principal.ID are always required. Wire this to your real auth
 	// (session, JWT, context) in application tests.
 	ApplyPrincipal func(*http.Request, Principal)
@@ -122,51 +147,66 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 	}
 	req, err := newTestRequest(c.Request.Method, c.Request.Path, body)
 	if err != nil {
-		t.Fatalf("denycase: %s: %v", c.Name, err)
+		t.Fatalf("denycase: %q: %v", c.Name, err)
 		return
 	}
 	copyHeaders(req.Header, c.Request.Header)
 	if c.ApplyPrincipal != nil {
+		before := snapshotRequest(req)
 		c.ApplyPrincipal(req, c.Principal)
+		if !requestChanged(before, req) {
+			t.Fatalf("denycase: %q: ApplyPrincipal did not modify the request", c.Name)
+			return
+		}
 	} else {
 		applyDefaultPrincipal(req, c.Principal)
 	}
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	// Scan the live recorder map. Result() snapshots headers at first write
+	// and looks up declared trailers by canonical key, so a late
+	// non-canonical assignment never appears on res.Header or res.Trailer.
+	live := rec.Header()
 	res := rec.Result()
 	defer res.Body.Close()
 	got, err := io.ReadAll(res.Body)
 	if err != nil {
-		t.Fatalf("denycase: read body: %v", err)
+		t.Fatalf("denycase: %q: read body: %v", c.Name, err)
 		return
 	}
 
 	if !slices.Contains(exp.Status, res.StatusCode) {
-		t.Fatalf("denycase: %s: status %d, want one of %v (fail closed)", c.Name, res.StatusCode, exp.Status)
+		t.Fatalf("denycase: %q: status %d, want one of %v (fail closed)", c.Name, res.StatusCode, exp.Status)
 		return
 	}
+
+	var findings []string
 	for _, needle := range exp.BodyMustNot {
-		if name, ok := valuesContain(res.Header, headerNames, needle); ok {
-			t.Fatalf("denycase: %s: response header %s leaked %q", c.Name, name, needle)
-			return
+		if name, ok := valuesContain(live, headerNames, needle); ok {
+			findings = append(findings, fmt.Sprintf("response header %s leaked %q", name, needle))
 		}
 		if name, ok := valuesContain(res.Trailer, headerNames, needle); ok {
-			t.Fatalf("denycase: %s: response trailer %s leaked %q", c.Name, name, needle)
-			return
+			findings = append(findings, fmt.Sprintf("response trailer %s leaked %q", name, needle))
 		}
 	}
+	encoded := false
 	if len(exp.BodyMustNot) > 0 {
-		if enc, ok := nonIdentityEncoding(res.Header); ok {
-			t.Fatalf("denycase: %s: BodyMustNot set but Content-Encoding is %q", c.Name, enc)
-			return
+		if msg, ok := encodingProblem(live, res.Trailer); ok {
+			findings = append(findings, msg)
+			encoded = true
 		}
 	}
-	for _, needle := range exp.BodyMustNot {
-		if bytes.Contains(got, []byte(needle)) {
-			t.Fatalf("denycase: %s: response leaked %q", c.Name, needle)
-			return
+	if !encoded {
+		for _, needle := range exp.BodyMustNot {
+			if bytes.Contains(got, []byte(needle)) {
+				findings = append(findings, fmt.Sprintf("response leaked %q", needle))
+			}
 		}
+	}
+	if len(findings) > 0 {
+		t.Fatalf("denycase: %q: %s", c.Name, strings.Join(findings, "; "))
+		return
 	}
 }
 
@@ -195,18 +235,124 @@ func applyDefaultPrincipal(req *http.Request, p Principal) {
 	req.Header.Set(HeaderPrincipal, p.ID)
 }
 
-func nonIdentityEncoding(h http.Header) (string, bool) {
+type requestSnapshot struct {
+	header http.Header
+	url    string
+	host   string
+	ctx    context.Context
+}
+
+func snapshotRequest(req *http.Request) requestSnapshot {
+	urlStr := ""
+	if req.URL != nil {
+		urlStr = req.URL.String()
+	}
+	return requestSnapshot{
+		header: req.Header.Clone(),
+		url:    urlStr,
+		host:   req.Host,
+		ctx:    req.Context(),
+	}
+}
+
+func requestChanged(before requestSnapshot, req *http.Request) bool {
+	if req.Host != before.host || req.Context() != before.ctx {
+		return true
+	}
+	urlStr := ""
+	if req.URL != nil {
+		urlStr = req.URL.String()
+	}
+	if urlStr != before.url {
+		return true
+	}
+	return !headerEqual(before.header, req.Header)
+}
+
+func headerEqual(a, b http.Header) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, vs := range a {
+		ovs, ok := b[k]
+		if !ok || !slices.Equal(vs, ovs) {
+			return false
+		}
+	}
+	return true
+}
+
+func encodingProblem(header, trailer http.Header) (string, bool) {
+	var parts []string
+	if v, ok := nonIdentityContentEncoding(header); ok {
+		parts = append(parts, fmt.Sprintf("Content-Encoding is %q", v))
+	}
+	if v, ok := compressedTransferEncoding(header); ok {
+		parts = append(parts, fmt.Sprintf("Transfer-Encoding is %q", v))
+	}
+	if v, ok := nonIdentityContentEncoding(trailer); ok {
+		parts = append(parts, fmt.Sprintf("trailer Content-Encoding is %q", v))
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return "BodyMustNot set but " + strings.Join(parts, " and "), true
+}
+
+func nonIdentityContentEncoding(h http.Header) (string, bool) {
+	var found []string
 	for k, vs := range h {
 		if http.CanonicalHeaderKey(k) != "Content-Encoding" {
 			continue
 		}
 		for _, v := range vs {
-			if v != "" && !strings.EqualFold(v, "identity") {
-				return v, true
+			for _, part := range splitHeaderList(v) {
+				if !strings.EqualFold(part, "identity") {
+					found = append(found, part)
+				}
 			}
 		}
 	}
-	return "", false
+	if len(found) == 0 {
+		return "", false
+	}
+	slices.Sort(found)
+	return strings.Join(found, ", "), true
+}
+
+func compressedTransferEncoding(h http.Header) (string, bool) {
+	var found []string
+	for k, vs := range h {
+		if http.CanonicalHeaderKey(k) != "Transfer-Encoding" {
+			continue
+		}
+		for _, v := range vs {
+			for _, part := range splitHeaderList(v) {
+				if _, ok := compressedTE[strings.ToLower(part)]; ok {
+					found = append(found, part)
+				}
+			}
+		}
+	}
+	if len(found) == 0 {
+		return "", false
+	}
+	slices.Sort(found)
+	return strings.Join(found, ", "), true
+}
+
+func splitHeaderList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if i := strings.IndexByte(part, ';'); i >= 0 {
+			part = strings.TrimSpace(part[:i])
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func leakNames(extra []string) []string {
@@ -216,8 +362,10 @@ func leakNames(extra []string) []string {
 // valuesContain reports whether any header in names has a value containing
 // needle. It ranges the map so a non-canonical key still matches. The
 // returned name is the matching map keys as written, sorted.
-// httptest.Result builds trailers with canonical keys, so non-canonical
-// trailer keys do not occur there.
+//
+// httptest.Result looks up declared trailers by canonical key and drops a
+// raw key such as ["location"]. Scan the recorder's live map for those;
+// res.Trailer only sees TrailerPrefix and canonical declared names.
 func valuesContain(h http.Header, names []string, needle string) (string, bool) {
 	want := make(map[string]struct{}, len(names))
 	for _, n := range names {
@@ -255,8 +403,14 @@ func (c Case) validate() error {
 	if err := validateRequestHeaders(c.Request.Header); err != nil {
 		return err
 	}
-	if c.Principal.Tenant == "" || c.Principal.ID == "" {
+	if strings.TrimSpace(c.Principal.Tenant) == "" || strings.TrimSpace(c.Principal.ID) == "" {
 		return errors.New("Principal.Tenant and Principal.ID are required")
+	}
+	if err := validatePrincipalValue("Tenant", c.Principal.Tenant); err != nil {
+		return err
+	}
+	if err := validatePrincipalValue("ID", c.Principal.ID); err != nil {
+		return err
 	}
 	for _, s := range c.Expect.Status {
 		if s != http.StatusForbidden && s != http.StatusNotFound {
@@ -283,20 +437,37 @@ func validateRequestHeaders(h http.Header) error {
 	if h == nil {
 		return nil
 	}
-	seen := make(map[string]string, len(h))
+	keys := make([]string, 0, len(h))
 	for k := range h {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
 		if !validHeaderToken(k) {
 			return fmt.Errorf("Request.Header name %q is not a valid header token", k)
 		}
-		can := http.CanonicalHeaderKey(k)
-		if prev, ok := seen[can]; ok {
-			keys := []string{prev, k}
-			slices.Sort(keys)
-			return fmt.Errorf("Request.Header has duplicate keys %q and %q", keys[0], keys[1])
-		}
-		seen[can] = k
 	}
-	return nil
+	groups := make(map[string][]string, len(keys))
+	for _, k := range keys {
+		can := http.CanonicalHeaderKey(k)
+		groups[can] = append(groups[can], k)
+	}
+	var dups []string
+	for can, names := range groups {
+		if len(names) > 1 {
+			dups = append(dups, can)
+		}
+	}
+	if len(dups) == 0 {
+		return nil
+	}
+	slices.Sort(dups)
+	names := groups[dups[0]]
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = fmt.Sprintf("%q", n)
+	}
+	return fmt.Errorf("Request.Header has duplicate keys %s", strings.Join(quoted, " and "))
 }
 
 func validateMethod(method string) error {
@@ -305,6 +476,9 @@ func validateMethod(method string) error {
 	}
 	if !validHeaderToken(method) {
 		return fmt.Errorf("Request.Method %q is not a valid token", method)
+	}
+	if _, ok := rfc9110Methods[method]; !ok {
+		return fmt.Errorf("Request.Method %q is not an RFC 9110 method", method)
 	}
 	return nil
 }
@@ -316,19 +490,44 @@ func validatePath(path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("Request.Path %q must start with /", path)
 	}
-	if !printableASCII(path) {
-		return fmt.Errorf("Request.Path %q contains a non-printable ASCII byte", path)
+	if err := rejectHiddenPathBytes(path); err != nil {
+		return err
 	}
 	return nil
 }
 
-func printableASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x21 || s[i] > 0x7E {
-			return false
+func rejectHiddenPathBytes(path string) error {
+	for i := 0; i < len(path); i++ {
+		if path[i] <= 0x20 || path[i] == 0x7f {
+			return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
 		}
 	}
-	return true
+	if !utf8.ValidString(path) {
+		return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
+	}
+	for _, r := range path {
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
+		}
+	}
+	return nil
+}
+
+func validatePrincipalValue(field, v string) error {
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] == 0x7f {
+			return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+		}
+	}
+	if !utf8.ValidString(v) {
+		return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+	}
+	for _, r := range v {
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+		}
+	}
+	return nil
 }
 
 func validateHeaderName(name string) error {
