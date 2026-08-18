@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -51,13 +52,9 @@ var rfc9110Methods = map[string]struct{}{
 	http.MethodPatch:   {},
 }
 
-var compressedTE = map[string]struct{}{
-	"gzip":     {},
-	"deflate":  {},
-	"compress": {},
-	"br":       {},
-	"zstd":     {},
-}
+const maxFindings = 8
+
+const trailerPrefix = "trailer:"
 
 // Kind names a shipped deny situation. The corpus itself is still empty.
 type Kind string
@@ -110,10 +107,11 @@ type Case struct {
 	Request   Request
 	Expect    Expect
 	// ApplyPrincipal writes the principal onto the request. If nil, denycase
-	// sets HeaderTenant and HeaderPrincipal. The callback must modify the
-	// request (headers, URL, Host, or Context). Principal.Tenant and
-	// Principal.ID are always required. Wire this to your real auth
-	// (session, JWT, context) in application tests.
+	// sets HeaderTenant and HeaderPrincipal. The callback must change
+	// Header, URL, Host, or Context. TLS, RemoteAddr, Form, and Body are
+	// not compared. Principal.Tenant and Principal.ID are always required.
+	// If Request.Header already has the value the callback would write,
+	// put that value in one place only.
 	ApplyPrincipal func(*http.Request, Principal)
 }
 
@@ -164,9 +162,10 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	// Scan the live recorder map. Result() snapshots headers at first write
-	// and looks up declared trailers by canonical key, so a late
-	// non-canonical assignment never appears on res.Header or res.Trailer.
+	// res.Header is the flushed wire snapshot. live still holds late
+	// trailer writes that Result() drops when the map key is not canonical.
+	// Scan wire headers plus late trailers only; post-commit non-trailer
+	// mutations are not on the wire.
 	live := rec.Header()
 	res := rec.Result()
 	defer res.Body.Close()
@@ -181,18 +180,19 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		return
 	}
 
+	trailers := declaredTrailers(res.Header, live, res.Trailer)
 	var findings []string
 	for _, needle := range exp.BodyMustNot {
-		if name, ok := valuesContain(live, headerNames, needle); ok {
+		if name, ok := headerLeaks(res.Header, trailers, headerNames, needle); ok {
 			findings = append(findings, fmt.Sprintf("response header %s leaked %q", name, needle))
 		}
-		if name, ok := valuesContain(res.Trailer, headerNames, needle); ok {
+		if name, ok := trailerLeaks(live, res.Trailer, trailers, headerNames, needle); ok {
 			findings = append(findings, fmt.Sprintf("response trailer %s leaked %q", name, needle))
 		}
 	}
 	encoded := false
 	if len(exp.BodyMustNot) > 0 {
-		if msg, ok := encodingProblem(live, res.Trailer); ok {
+		if msg, ok := encodingProblem(res.Header, res.Trailer); ok {
 			findings = append(findings, msg)
 			encoded = true
 		}
@@ -205,7 +205,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		}
 	}
 	if len(findings) > 0 {
-		t.Fatalf("denycase: %q: %s", c.Name, strings.Join(findings, "; "))
+		t.Fatalf("denycase: %q: %s", c.Name, formatFindings(findings))
 		return
 	}
 }
@@ -270,16 +270,7 @@ func requestChanged(before requestSnapshot, req *http.Request) bool {
 }
 
 func headerEqual(a, b http.Header) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, vs := range a {
-		ovs, ok := b[k]
-		if !ok || !slices.Equal(vs, ovs) {
-			return false
-		}
-	}
-	return true
+	return maps.EqualFunc(a, b, slices.Equal[[]string])
 }
 
 func encodingProblem(header, trailer http.Header) (string, bool) {
@@ -313,11 +304,7 @@ func nonIdentityContentEncoding(h http.Header) (string, bool) {
 			}
 		}
 	}
-	if len(found) == 0 {
-		return "", false
-	}
-	slices.Sort(found)
-	return strings.Join(found, ", "), true
+	return joinUnique(found)
 }
 
 func compressedTransferEncoding(h http.Header) (string, bool) {
@@ -328,16 +315,22 @@ func compressedTransferEncoding(h http.Header) (string, bool) {
 		}
 		for _, v := range vs {
 			for _, part := range splitHeaderList(v) {
-				if _, ok := compressedTE[strings.ToLower(part)]; ok {
+				low := strings.ToLower(part)
+				if low != "chunked" && low != "identity" {
 					found = append(found, part)
 				}
 			}
 		}
 	}
+	return joinUnique(found)
+}
+
+func joinUnique(found []string) (string, bool) {
 	if len(found) == 0 {
 		return "", false
 	}
 	slices.Sort(found)
+	found = slices.Compact(found)
 	return strings.Join(found, ", "), true
 }
 
@@ -359,35 +352,128 @@ func leakNames(extra []string) []string {
 	return append(append([]string(nil), defaultLeakHeaders...), extra...)
 }
 
-// valuesContain reports whether any header in names has a value containing
-// needle. It ranges the map so a non-canonical key still matches. The
-// returned name is the matching map keys as written, sorted.
-//
-// httptest.Result looks up declared trailers by canonical key and drops a
-// raw key such as ["location"]. Scan the recorder's live map for those;
-// res.Trailer only sees TrailerPrefix and canonical declared names.
-func valuesContain(h http.Header, names []string, needle string) (string, bool) {
+func leakWant(names []string) map[string]struct{} {
 	want := make(map[string]struct{}, len(names))
 	for _, n := range names {
 		want[http.CanonicalHeaderKey(n)] = struct{}{}
 	}
-	var hits []string
-	for k, vs := range h {
-		if _, ok := want[http.CanonicalHeaderKey(k)]; !ok {
-			continue
-		}
-		for _, v := range vs {
-			if strings.Contains(v, needle) {
-				hits = append(hits, k)
-				break
+	return want
+}
+
+func hasTrailerPrefix(k string) bool {
+	return len(k) >= len(trailerPrefix) && strings.EqualFold(k[:len(trailerPrefix)], trailerPrefix)
+}
+
+func leakKey(k string) string {
+	if hasTrailerPrefix(k) {
+		return http.CanonicalHeaderKey(k[len(trailerPrefix):])
+	}
+	return http.CanonicalHeaderKey(k)
+}
+
+func declaredTrailers(wire, live, result http.Header) map[string]struct{} {
+	out := make(map[string]struct{})
+	addDecl := func(h http.Header) {
+		for k, vs := range h {
+			if leakKey(k) != "Trailer" {
+				continue
+			}
+			for _, v := range vs {
+				for _, part := range splitHeaderList(v) {
+					out[http.CanonicalHeaderKey(part)] = struct{}{}
+				}
 			}
 		}
 	}
+	addDecl(wire)
+	addDecl(live)
+	for k := range result {
+		out[leakKey(k)] = struct{}{}
+	}
+	for k := range live {
+		if hasTrailerPrefix(k) {
+			out[leakKey(k)] = struct{}{}
+		}
+	}
+	return out
+}
+
+func containsNeedle(vs []string, needle string) bool {
+	for _, v := range vs {
+		if strings.Contains(v, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func joinHits(hits []string) (string, bool) {
 	if len(hits) == 0 {
 		return "", false
 	}
 	slices.Sort(hits)
 	return strings.Join(hits, ", "), true
+}
+
+func headerLeaks(wire http.Header, trailers map[string]struct{}, names []string, needle string) (string, bool) {
+	want := leakWant(names)
+	var hits []string
+	for k, vs := range wire {
+		can := leakKey(k)
+		if _, ok := want[can]; !ok {
+			continue
+		}
+		if _, skip := trailers[can]; skip {
+			continue
+		}
+		if containsNeedle(vs, needle) {
+			hits = append(hits, k)
+		}
+	}
+	return joinHits(hits)
+}
+
+func trailerLeaks(live, result http.Header, trailers map[string]struct{}, names []string, needle string) (string, bool) {
+	want := leakWant(names)
+	seen := make(map[string]string)
+	consider := func(k string, vs []string) {
+		can := leakKey(k)
+		if _, ok := want[can]; !ok {
+			return
+		}
+		if _, isT := trailers[can]; !isT && !hasTrailerPrefix(k) {
+			return
+		}
+		if !containsNeedle(vs, needle) {
+			return
+		}
+		if _, ok := seen[can]; ok {
+			return
+		}
+		display := k
+		if hasTrailerPrefix(k) {
+			display = k[len(trailerPrefix):]
+		}
+		seen[can] = display
+	}
+	for k, vs := range result {
+		consider(k, vs)
+	}
+	for k, vs := range live {
+		consider(k, vs)
+	}
+	var hits []string
+	for _, d := range seen {
+		hits = append(hits, d)
+	}
+	return joinHits(hits)
+}
+
+func formatFindings(findings []string) string {
+	if len(findings) <= maxFindings {
+		return strings.Join(findings, "; ")
+	}
+	return strings.Join(findings[:maxFindings], "; ") + fmt.Sprintf("; and %d more", len(findings)-maxFindings)
 }
 
 func (c Case) validate() error {
@@ -462,12 +548,16 @@ func validateRequestHeaders(h http.Header) error {
 		return nil
 	}
 	slices.Sort(dups)
-	names := groups[dups[0]]
-	quoted := make([]string, len(names))
-	for i, n := range names {
-		quoted[i] = fmt.Sprintf("%q", n)
+	var parts []string
+	for _, can := range dups {
+		names := groups[can]
+		quoted := make([]string, len(names))
+		for i, n := range names {
+			quoted[i] = fmt.Sprintf("%q", n)
+		}
+		parts = append(parts, strings.Join(quoted, " and "))
 	}
-	return fmt.Errorf("Request.Header has duplicate keys %s", strings.Join(quoted, " and "))
+	return fmt.Errorf("Request.Header has duplicate keys %s", strings.Join(parts, "; "))
 }
 
 func validateMethod(method string) error {
@@ -490,41 +580,25 @@ func validatePath(path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("Request.Path %q must start with /", path)
 	}
-	if err := rejectHiddenPathBytes(path); err != nil {
-		return err
-	}
-	return nil
-}
-
-func rejectHiddenPathBytes(path string) error {
-	for i := 0; i < len(path); i++ {
-		if path[i] <= 0x20 || path[i] == 0x7f {
-			return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
-		}
-	}
-	if !utf8.ValidString(path) {
-		return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
-	}
-	for _, r := range path {
-		if unicode.Is(unicode.Cf, r) {
-			return fmt.Errorf("Request.Path %q contains a space, control, or format character", path)
-		}
-	}
-	return nil
+	return rejectHiddenText("Request.Path", path)
 }
 
 func validatePrincipalValue(field, v string) error {
-	for i := 0; i < len(v); i++ {
-		if v[i] < 0x20 || v[i] == 0x7f {
-			return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+	return rejectHiddenText("Principal."+field, v)
+}
+
+func rejectHiddenText(what, s string) error {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x20 || s[i] == 0x7f {
+			return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 		}
 	}
-	if !utf8.ValidString(v) {
-		return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+	if !utf8.ValidString(s) {
+		return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 	}
-	for _, r := range v {
-		if unicode.Is(unicode.Cf, r) {
-			return fmt.Errorf("Principal.%s %q contains a space, control, or format character", field, v)
+	for _, r := range s {
+		if !unicode.IsPrint(r) || r == '\u115F' || r == '\u3164' || r == '\uFFA0' {
+			return fmt.Errorf("%s %q contains a space, control, or invisible character", what, s)
 		}
 	}
 	return nil

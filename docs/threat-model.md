@@ -45,11 +45,11 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 - An empty needle or empty / non-token `HeaderMustNot` name is invalid.
 - Byte-exact also applies to the four default headers. Percent-encoding (`tenant%2DA`), `filename*`, and `http.SetCookie` sanitizing are not decoded. Short needles can match structured values such as a `Set-Cookie` `Expires` date.
 - `httptest` and the HTTP server drop forbidden trailer names (`Content-Type`, `Cache-Control`, `Authorization`, …). Those are not scanned as trailers. The same name set via `http.TrailerPrefix` is scanned.
-- Header and trailer leaks are checked on the recorder's live header map and on `Result().Trailer`, then the encoding gate, then the body. All hits are reported in one failure.
-- If `BodyMustNot` is set and any `Content-Encoding` token (header or trailer) is present and not `identity`, or any `Transfer-Encoding` token is `gzip` / `deflate` / `compress` / `br` / `zstd`, the test fails. `chunked` is allowed. The library does not decode gzip. JSON `\u003c` / `\u003e` / `\u0026` are not unescaped; needles must match the bytes the handler wrote.
-- `Principal.Tenant` and `Principal.ID` are always required, including when `ApplyPrincipal` is set. Blank, control, and format-rune values are rejected. A missing tenant cannot pass as a BOLA deny. Anonymous deny is out of scope (authn, not BOLA).
-- `ApplyPrincipal` must modify the request (headers, URL, Host, or Context). A no-op or a write to a cloned request is invalid.
-- `Request.Method` must be an RFC 9110 method, exact case. `Request.Path` may be non-ASCII; space, C0/DEL, invalid UTF-8, and format characters (U+200B) are rejected. Encode spaces as `%20`. `Request.Header` names must be RFC 7230 tokens. Request header *values* are not validated.
+- Header leaks are checked on the flushed wire snapshot (`Result().Header`). Trailer leaks are checked on declared / `Trailer:`-prefixed late writes and on `Result().Trailer`. Post-commit non-trailer header mutations are ignored. Header and trailer hits, then the encoding gate, are reported in one failure. The body is scanned only when the encoding gate does not fire.
+- If `BodyMustNot` is set and any `Content-Encoding` token (header or trailer) is present and not `identity`, or any `Transfer-Encoding` token is not `chunked` or `identity`, the test fails. The library does not decode gzip. JSON `\u003c` / `\u003e` / `\u0026` are not unescaped; needles must match the bytes the handler wrote.
+- `Principal.Tenant` and `Principal.ID` are always required, including when `ApplyPrincipal` is set. Blank, space, control, non-printable, and a few invisible-letter values are rejected. A missing tenant cannot pass as a BOLA deny. Anonymous deny is out of scope (authn, not BOLA).
+- `ApplyPrincipal` must change Header, URL, Host, or Context. TLS, RemoteAddr, Form, and Body are not compared. A no-op, a write to a cloned request, or `Set` of a value already on the request is invalid; put a preset auth header in one place only.
+- `Request.Method` must be an RFC 9110 method, exact case. `Request.Path` may be non-ASCII; space, C0/DEL, invalid UTF-8, non-printable runes (NBSP, NEL), and Hangul/Braille fillers are rejected. Encode spaces as `%20`. `Request.Header` names must be RFC 7230 tokens. Request header *values* are not validated.
 
 ## Residual risk
 
@@ -57,7 +57,7 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 - A handler that returns 403 with an empty body but still performed the write is not caught in v0.1 (no mutation verify).
 - An empty `Corpus` means authors must write their own cases until the fixture pack exists.
 - A gzipped body with no `Content-Encoding` and no compressed `Transfer-Encoding` is scanned as raw bytes and may miss a leak.
-- `ApplyPrincipal` that sets a typo'd auth header still mutates the request, so the case can pass on an anonymous 403. denycase cannot know the app's auth header.
+- `ApplyPrincipal` that sets a typo'd auth header still mutates the request, so the case can pass on an anonymous 403. denycase cannot know the app's auth header. Setting `TLS` or `RemoteAddr` only is treated as a no-op.
 - Only Location, Content-Location, Content-Disposition, and Set-Cookie are scanned by default. `ETag`, `Link`, `Refresh`, `WWW-Authenticate`, `X-Accel-Redirect`, `X-Owner`, and every other header are unscanned unless listed in `HeaderMustNot`.
 - A leak that exists only as a header name is not expressible. `HeaderMustNot` still only reads values. A typo in a listed name (`X-Ownr`, or a needle used as a name) scans nothing and the test stays green.
 - A handler panic is a failed test, not a silent allow. `MustDeny` does not recover: `testing` repanics, the process exits, later cases in the same run do not execute, and `Case.Name` is not in the output.
