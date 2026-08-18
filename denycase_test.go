@@ -1087,6 +1087,26 @@ func TestMustDenyIgnoresLateHeaderWithoutTrailer(t *testing.T) {
 	}
 }
 
+func TestMustDenyIgnoresUnlistedPrefixedTrailer(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(http.TrailerPrefix+"X-Random", "/x/tenant-A")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "unlisted trailer",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if got.failed {
+		t.Fatalf("prefixed trailer outside the leak list should pass, got msg=%q", got.msg)
+	}
+}
+
 func TestMustDenyFailsOnLowercaseTrailerPrefix(t *testing.T) {
 	t.Parallel()
 	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
