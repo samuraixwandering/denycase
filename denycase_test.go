@@ -1484,8 +1484,8 @@ func TestMustDenyApplyPrincipalAlreadyHadValue(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer "+p.ID)
 		},
 	}, http.HandlerFunc(denyOK))
-	if !got.failed || !strings.Contains(got.msg, "already had these header values") {
-		t.Fatalf("want already-had-value message, got failed=%v msg=%q", got.failed, got.msg)
+	if !got.failed || !strings.Contains(got.msg, "put it in one place only") {
+		t.Fatalf("want one-place-only message, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 
@@ -1565,6 +1565,48 @@ func TestMustDenyCapsFindings(t *testing.T) {
 	}
 	if strings.Contains(got.msg, `leaked "n9"`) {
 		t.Fatalf("ninth body leak should be elided: %q", got.msg)
+	}
+}
+
+func TestMustDenyCapsFindingsKeepsEncoding(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Set-Cookie", "a-tenant=1; b-tenant=1; c-tenant=1; d-tenant=1; e-tenant=1; f-tenant=1; g-tenant=1; h-tenant=1; i-tenant=1; j-tenant=1")
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	needles := []string{"a-tenant", "b-tenant", "c-tenant", "d-tenant", "e-tenant", "f-tenant", "g-tenant", "h-tenant", "i-tenant", "j-tenant"}
+	got := runMustDeny(t, Case{
+		Name:      "cap enc",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: needles,
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "Content-Encoding") {
+		t.Fatalf("want encoding line under cap, got failed=%v msg=%q", got.failed, got.msg)
+	}
+}
+
+func TestMustDenyRejectsPrefixedTrailerTransferEncoding(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header()["trailer:transfer-encoding"] = []string{"gzip"}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	got := runMustDeny(t, Case{
+		Name:      "trailer te",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request:   Request{Method: http.MethodGet, Path: "/invoices/a"},
+		Expect: Expect{
+			Status:      []int{http.StatusForbidden},
+			BodyMustNot: []string{"tenant-A"},
+		},
+	}, h)
+	if !got.failed || !strings.Contains(got.msg, "Transfer-Encoding") {
+		t.Fatalf("want trailer Transfer-Encoding gate, got failed=%v msg=%q", got.failed, got.msg)
 	}
 }
 

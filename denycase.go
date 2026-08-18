@@ -151,7 +151,7 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 		before := snapshotRequest(req)
 		c.ApplyPrincipal(req, c.Principal)
 		if !requestChanged(before, req) {
-			t.Fatalf("denycase: %q: %s", c.Name, applyPrincipalUnchanged(before))
+			t.Fatalf("denycase: %q: %s", c.Name, applyPrincipalUnchanged())
 			return
 		}
 	} else {
@@ -181,7 +181,9 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 	var findings []string
 	if len(exp.BodyMustNot) > 0 {
 		encMsg, encoded := encodingProblem(res.Header, live, res.Trailer)
-		if !encoded {
+		if encoded {
+			findings = append(findings, encMsg)
+		} else {
 			for _, needle := range exp.BodyMustNot {
 				if bytes.Contains(got, []byte(needle)) {
 					findings = append(findings, fmt.Sprintf("response leaked %q", needle))
@@ -201,9 +203,6 @@ func MustDeny(t testing.TB, c Case, h http.Handler) {
 			if tok {
 				findings = append(findings, fmt.Sprintf("response trailer %s leaked %q", trl, needle))
 			}
-		}
-		if encoded {
-			findings = append(findings, encMsg)
 		}
 	}
 	if len(findings) > 0 {
@@ -275,12 +274,8 @@ func headerEqual(a, b http.Header) bool {
 	return maps.EqualFunc(a, b, slices.Equal[[]string])
 }
 
-func applyPrincipalUnchanged(before requestSnapshot) string {
-	msg := "ApplyPrincipal did not change Header, URL, Host, or Context"
-	if len(before.header) > 0 {
-		return msg + " (request already had these header values)"
-	}
-	return msg
+func applyPrincipalUnchanged() string {
+	return "ApplyPrincipal did not change Header, URL, Host, or Context (if your callback writes a value Request.Header already has, put it in one place only)"
 }
 
 func encodingProblem(header, live, trailer http.Header) (string, bool) {
@@ -293,6 +288,9 @@ func encodingProblem(header, live, trailer http.Header) (string, bool) {
 	}
 	if v, ok := trailerContentEncoding(live, trailer); ok {
 		parts = append(parts, fmt.Sprintf("trailer Content-Encoding is %q", v))
+	}
+	if v, ok := trailerTransferEncoding(live, trailer); ok {
+		parts = append(parts, fmt.Sprintf("trailer Transfer-Encoding is %q", v))
 	}
 	if len(parts) == 0 {
 		return "", false
@@ -320,6 +318,32 @@ func trailerContentEncoding(live, trailer http.Header) (string, bool) {
 	for k, vs := range live {
 		if hasTrailerPrefix(k) {
 			collectCE(k, vs)
+		}
+	}
+	return joinUnique(found)
+}
+
+func trailerTransferEncoding(live, trailer http.Header) (string, bool) {
+	var found []string
+	collectTE := func(k string, vs []string) {
+		if leakKey(k) != "Transfer-Encoding" {
+			return
+		}
+		for _, v := range vs {
+			for _, part := range splitHeaderList(v) {
+				low := strings.ToLower(part)
+				if low != "chunked" && low != "identity" {
+					found = append(found, part)
+				}
+			}
+		}
+	}
+	for k, vs := range trailer {
+		collectTE(k, vs)
+	}
+	for k, vs := range live {
+		if hasTrailerPrefix(k) {
+			collectTE(k, vs)
 		}
 	}
 	return joinUnique(found)
