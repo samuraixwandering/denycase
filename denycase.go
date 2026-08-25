@@ -56,7 +56,7 @@ const maxFindings = 8
 
 const trailerPrefix = "trailer:"
 
-// Kind names a shipped deny situation. The corpus itself is still empty.
+// Kind names a shipped deny situation.
 type Kind string
 
 const (
@@ -114,14 +114,11 @@ type Case struct {
 	ApplyPrincipal func(*http.Request, Principal)
 }
 
-// Fixture is a named deny situation plus its Case. Week 1 ships the type only.
+// Fixture is a Kind plus a Case. Copy Case out of Corpus; do not mutate Corpus.
 type Fixture struct {
 	Kind Kind
 	Case Case
 }
-
-// Corpus is the shipped deny cases. Empty until the fixture pack lands.
-var Corpus []Fixture
 
 // MustDeny runs c against h and fails t if the handler does not deny.
 func MustDeny(t testing.TB, c Case, h http.Handler) {

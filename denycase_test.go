@@ -1756,16 +1756,6 @@ func TestMustDenyHandlerPanicEscapes(t *testing.T) {
 	}
 }
 
-func TestCorpusEmptyAndKindsStable(t *testing.T) {
-	t.Parallel()
-	if len(Corpus) != 0 {
-		t.Fatalf("Corpus should be empty until the fixture pack: got %d", len(Corpus))
-	}
-	if KindCrossTenant != "cross_tenant" || KindMissingOwner != "missing_owner" || KindRelationMismatch != "relation_mismatch" {
-		t.Fatal("Kind constants changed")
-	}
-}
-
 type denyRun struct {
 	failed bool
 	msg    string

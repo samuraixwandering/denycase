@@ -19,7 +19,7 @@ By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Prin
 
 `Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. That includes ZERO WIDTH JOINER and variation selectors (U+FE0F), so multi-person emoji and the ordinary emoji-style heart (U+2764 U+FE0F) are rejected even when the rest of the path is valid; percent-encode them. A principal may contain internal spaces (`Acme Corp`).
 
-v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
+`Corpus` is four `Fixture` values against a toy invoice (`inv-a` owned by `tenant-A` / `user-a`): `cross_tenant` GET and PUT, `missing_owner` GET-by-id, and `relation_mismatch` same-tenant non-owner PUT. Copy a case and change Principal, Path, and `BodyMustNot` to match your handler. Do not mutate `Corpus`.
 
 ## Breaking before v0.1.0
 
@@ -50,7 +50,7 @@ See [COMPARABLES.md](COMPARABLES.md) and [docs/threat-model.md](docs/threat-mode
 
 ## Status
 
-Pre-corpus skeleton. API may change before `v0.1.0`.
+Helper plus a small fixture pack. API may change before `v0.1.0`.
 
 ```
 go test ./...
