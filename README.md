@@ -19,7 +19,7 @@ By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Prin
 
 `Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. That includes ZERO WIDTH JOINER and variation selectors (U+FE0F), so multi-person emoji and the ordinary emoji-style heart (U+2764 U+FE0F) are rejected even when the rest of the path is valid; percent-encode them. A principal may contain internal spaces (`Acme Corp`).
 
-`Corpus` is four `Fixture` values against a toy invoice (`inv-a` owned by `tenant-A` / `user-a`): `cross_tenant` GET and PUT, `missing_owner` GET-by-id, and `relation_mismatch` same-tenant non-owner PUT. Copy a case and change Principal, Path, and `BodyMustNot` to match your handler. Do not mutate `Corpus`.
+`Corpus()` returns four `Fixture` values against a toy invoice (`inv-a` owned by `tenant-A` / `user-a`): `cross_tenant` GET and PUT, `missing_owner` same-tenant non-owner GET, and `relation_mismatch` same-tenant non-owner PUT. Copy a case and change Principal, Path, and `BodyMustNot` to match your handler. On writes, set Body and Header too. Set Status if your handler denies with 404.
 
 ## Breaking before v0.1.0
 

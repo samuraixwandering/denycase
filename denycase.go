@@ -114,7 +114,7 @@ type Case struct {
 	ApplyPrincipal func(*http.Request, Principal)
 }
 
-// Fixture is a Kind plus a Case. Copy Case out of Corpus; do not mutate Corpus.
+// Fixture is a Kind plus a Case.
 type Fixture struct {
 	Kind Kind
 	Case Case
