@@ -708,11 +708,16 @@ func validHeaderToken(s string) bool {
 	return true
 }
 
-func (e Expect) normalized() Expect {
+func cloneExpect(e Expect) Expect {
 	out := e
 	out.Status = slices.Clone(e.Status)
 	out.BodyMustNot = slices.Clone(e.BodyMustNot)
 	out.HeaderMustNot = slices.Clone(e.HeaderMustNot)
+	return out
+}
+
+func (e Expect) normalized() Expect {
+	out := cloneExpect(e)
 	if len(out.Status) == 0 {
 		out.Status = []int{http.StatusForbidden}
 	}

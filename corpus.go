@@ -3,13 +3,20 @@ package denycase
 import (
 	"bytes"
 	"net/http"
-	"slices"
 )
 
 func denied(needles ...string) Expect {
 	e := Denied()
 	e.BodyMustNot = needles
 	return e
+}
+
+func getReq(path string) Request {
+	return Request{
+		Method: http.MethodGet,
+		Path:   path,
+		Header: http.Header{},
+	}
 }
 
 func jsonWrite(method, path string) Request {
@@ -27,7 +34,7 @@ var corpus = []Fixture{
 		Case: Case{
 			Name:      "cross-tenant read",
 			Principal: Principal{Tenant: "tenant-B", ID: "user-b"},
-			Request:   Request{Method: http.MethodGet, Path: "/invoices/inv-a"},
+			Request:   getReq("/invoices/inv-a"),
 			Expect:    denied("tenant-A", "secret-a", "user-a"),
 		},
 	},
@@ -43,9 +50,18 @@ var corpus = []Fixture{
 	{
 		Kind: KindMissingOwner,
 		Case: Case{
+			Name:      "colliding owner id",
+			Principal: Principal{Tenant: "tenant-B", ID: "user-a"},
+			Request:   getReq("/invoices/inv-a"),
+			Expect:    denied("tenant-A", "secret-a"),
+		},
+	},
+	{
+		Kind: KindRelationMismatch,
+		Case: Case{
 			Name:      "non-owner read",
 			Principal: Principal{Tenant: "tenant-A", ID: "user-c"},
-			Request:   Request{Method: http.MethodGet, Path: "/invoices/inv-a"},
+			Request:   getReq("/invoices/inv-a"),
 			Expect:    denied("secret-a", "user-a"),
 		},
 	},
@@ -63,21 +79,23 @@ var corpus = []Fixture{
 // Corpus returns a copy of the shipped deny cases for a toy invoice resource:
 // inv-a belongs to tenant-A / user-a; user-c is in tenant-A but not the owner;
 // user-b is in tenant-B. Copy a case and change Principal, Path, BodyMustNot,
-// and on writes Body and Header, to match the handler under test. Set Status
-// if the handler denies with 404.
+// and HeaderMustNot to match the handler under test. On writes, set Body and
+// Header too. Set Status if the handler denies with 404.
+//
+// Reads are owner-scoped: a tenant-wide GET that only checks owner on writes
+// fails the relation_mismatch GET.
 func Corpus() []Fixture {
 	out := make([]Fixture, len(corpus))
 	for i, f := range corpus {
-		out[i] = Fixture{Kind: f.Kind, Case: cloneCase(f.Case)}
+		out[i] = f
+		out[i].Case = cloneCase(f.Case)
 	}
 	return out
 }
 
 func cloneCase(c Case) Case {
 	out := c
-	out.Expect.Status = slices.Clone(c.Expect.Status)
-	out.Expect.BodyMustNot = slices.Clone(c.Expect.BodyMustNot)
-	out.Expect.HeaderMustNot = slices.Clone(c.Expect.HeaderMustNot)
+	out.Expect = cloneExpect(c.Expect)
 	out.Request.Body = bytes.Clone(c.Request.Body)
 	out.Request.Header = c.Request.Header.Clone()
 	return out

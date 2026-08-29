@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"runtime"
@@ -1042,8 +1043,55 @@ func TestMustDenyRejectsControlPrincipal(t *testing.T) {
 func TestExpectFieldCount(t *testing.T) {
 	t.Parallel()
 	if n := reflect.TypeOf(Expect{}).NumField(); n != 3 {
-		t.Fatalf("Expect has %d fields; update normalized() clones", n)
+		t.Fatalf("Expect has %d fields; update cloneExpect (normalized and cloneCase)", n)
 	}
+}
+
+func TestRequestFieldCount(t *testing.T) {
+	t.Parallel()
+	if n := reflect.TypeOf(Request{}).NumField(); n != 4 {
+		t.Fatalf("Request has %d fields; update cloneCase", n)
+	}
+}
+
+func TestCloneExpectIndependentCopies(t *testing.T) {
+	t.Parallel()
+	e := Expect{
+		Status:        []int{http.StatusForbidden},
+		BodyMustNot:   []string{"secret-a"},
+		HeaderMustNot: []string{"X-Owner"},
+	}
+	c := cloneExpect(e)
+	c.Status[0] = http.StatusNotFound
+	c.BodyMustNot[0] = "mutated"
+	c.HeaderMustNot[0] = "mutated"
+	if e.Status[0] != http.StatusForbidden || e.BodyMustNot[0] != "secret-a" || e.HeaderMustNot[0] != "X-Owner" {
+		t.Fatal("cloneExpect aliased Expect slices")
+	}
+}
+
+func TestMustDenySendsRequestBody(t *testing.T) {
+	t.Parallel()
+	want := []byte(`{"note":"updated"}`)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(got, want) || r.Header.Get("Content-Type") != "application/json" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	MustDeny(t, Case{
+		Name:      "body round trip",
+		Principal: Principal{Tenant: "B", ID: "user-b"},
+		Request: Request{
+			Method: http.MethodPut,
+			Path:   "/invoices/a",
+			Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body:   want,
+		},
+		Expect: Denied(),
+	}, h)
 }
 
 func TestMustDenyFailsOnLateScrubbedHeader(t *testing.T) {
