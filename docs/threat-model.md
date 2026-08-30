@@ -1,11 +1,11 @@
 # Threat model (v0.1)
 
 Scope: a Go test helper that runs deny cases against an in-process `http.Handler`.
-Date: 2026-08-18.
+Date: 2026-08-30.
 
 ## Assets
 
-- The application's object-level authorization: tenant A must not read, write, or list tenant B's objects.
+- The application's object-level authorization: tenant A must not read or write tenant B's objects on the path and verb a case names.
 - The test's fail-closed property: a passing test must not mean "we did not notice an allow."
 
 ## Actors
@@ -32,7 +32,7 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 
 ## Trust boundary
 
-`MustDeny` is called from a test. The handler and the Case are both supplied by the test author. There is no parser of untrusted fixture files in v0.1. When a file corpus lands, treat fixture files as test data from the same repo, not as input from the internet.
+`MustDeny` is called from a test. The handler and the Case are both supplied by the test author. The shipped corpus is in-package Go data returned by `Corpus()`. There is no file parser. Treat those fixtures as test data from this repo, not as input from the internet.
 
 ## Fail-closed rules
 
@@ -55,7 +55,10 @@ JWT metadata (`alg=none`, algorithm confusion) is noted for later. It is not in 
 
 - Default header injection (`X-Denycase-Tenant`) is not real auth. Tests that forget `ApplyPrincipal` only prove the handler reads those headers.
 - A handler that returns 403 with an empty body but still performed the write is not caught in v0.1 (no mutation verify).
-- An empty `Corpus` means authors must write their own cases until the fixture pack exists.
+- `Corpus()` paths and ids are the invoice example. Copy and rewrite them for the app under test. Running them unchanged against a different handler is a vacuous 403 or a false fail.
+- `Corpus()` treats reads as owner-scoped. A handler that allows any principal in the tenant to GET, and only checks owner on writes, fails the `relation_mismatch` GET. That is a corpus assumption, not proof the handler is buggy.
+- `relation_mismatch` fixtures needle the owner id. A same-tenant 403 that names the owner fails those cases. That is a corpus assumption, not a cross-tenant leak.
+- `Corpus()` is GET and PUT on `/invoices/inv-a`. Listing, DELETE, and sub-resources are unreached.
 - A compressed body is scanned as raw bytes. A leak that exists only after decompression is not detected. A short needle can also match those compressed bytes when nothing leaked.
 - `ApplyPrincipal` that sets a typo'd auth header still mutates the request, so the case can pass on an anonymous 403. denycase cannot know the app's auth header. Setting `TLS` or `RemoteAddr` only is treated as a no-op.
 - Only Location, Content-Location, Content-Disposition, and Set-Cookie are scanned by default. `ETag`, `Link`, `Refresh`, `WWW-Authenticate`, `X-Accel-Redirect`, `X-Owner`, and every other header are unscanned unless listed in `HeaderMustNot`.

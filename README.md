@@ -19,12 +19,14 @@ By default the principal is injected as `X-Denycase-Tenant` and `X-Denycase-Prin
 
 `Request.Method` must be an RFC 9110 method (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH`), exact case. Paths may contain non-ASCII. Spaces, controls, non-printable runes, default-ignorable characters, and U+2800 are rejected. That includes ZERO WIDTH JOINER and variation selectors (U+FE0F), so multi-person emoji and the ordinary emoji-style heart (U+2764 U+FE0F) are rejected even when the rest of the path is valid; percent-encode them. A principal may contain internal spaces (`Acme Corp`).
 
-v0.1 ships the helper and the three case *kinds* (`cross_tenant`, `missing_owner`, `relation_mismatch`). The fixture corpus is still empty.
+`Corpus()` returns six `Fixture` values against a toy invoice (`inv-a` owned by `tenant-A` / `user-a`): `cross_tenant` GET and PUT, `missing_owner` GET and PUT with a colliding owner id (tenant-B / `user-a`), and `relation_mismatch` same-tenant non-owner GET and PUT. Copy a case and change Principal, Path, `BodyMustNot`, and `HeaderMustNot` to match your handler. On writes, set Body and Header too. Set Status if your handler denies with 404. Reads are owner-scoped.
 
 ## Breaking before v0.1.0
 
 These used to be valid cases and now fail:
 
+- `Corpus` as an exported variable; it is now the function `Corpus()`
+- `KindMissingOwner` used to be a same-tenant non-owner GET; it is now a colliding-id (tenant-B / `user-a`) GET and PUT. Same-tenant non-owner is `KindRelationMismatch`
 - `HeaderMustNot` without `BodyMustNot`
 - `ApplyPrincipal` set and a zero or blank `Principal`
 - `ApplyPrincipal` that does not change Header, URL, Host, or Context
@@ -50,7 +52,7 @@ See [COMPARABLES.md](COMPARABLES.md) and [docs/threat-model.md](docs/threat-mode
 
 ## Status
 
-Pre-corpus skeleton. API may change before `v0.1.0`.
+Helper plus a small fixture pack. API may change before `v0.1.0`.
 
 ```
 go test ./...
