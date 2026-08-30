@@ -57,6 +57,15 @@ var corpus = []Fixture{
 		},
 	},
 	{
+		Kind: KindMissingOwner,
+		Case: Case{
+			Name:      "colliding owner id write",
+			Principal: Principal{Tenant: "tenant-B", ID: "user-a"},
+			Request:   jsonWrite(http.MethodPut, "/invoices/inv-a"),
+			Expect:    denied("tenant-A", "secret-a"),
+		},
+	},
+	{
 		Kind: KindRelationMismatch,
 		Case: Case{
 			Name:      "non-owner read",
@@ -78,9 +87,11 @@ var corpus = []Fixture{
 
 // Corpus returns a copy of the shipped deny cases for a toy invoice resource:
 // inv-a belongs to tenant-A / user-a; user-c is in tenant-A but not the owner;
-// user-b is in tenant-B. Copy a case and change Principal, Path, BodyMustNot,
-// and HeaderMustNot to match the handler under test. On writes, set Body and
-// Header too. Set Status if the handler denies with 404.
+// user-b is in tenant-B. Each Kind has a GET and a PUT. missing_owner is a
+// colliding owner id (tenant-B / user-a), not a same-tenant non-owner.
+// Copy a case and change Principal, Path, BodyMustNot, and HeaderMustNot
+// to match the handler under test. On writes, set Body and Header too.
+// Set Status if the handler denies with 404.
 //
 // Reads are owner-scoped: a tenant-wide GET that only checks owner on writes
 // fails the relation_mismatch GET.

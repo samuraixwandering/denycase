@@ -1054,6 +1054,20 @@ func TestRequestFieldCount(t *testing.T) {
 	}
 }
 
+func TestCaseFieldCount(t *testing.T) {
+	t.Parallel()
+	if n := reflect.TypeOf(Case{}).NumField(); n != 5 {
+		t.Fatalf("Case has %d fields; update cloneCase", n)
+	}
+}
+
+func TestFixtureFieldCount(t *testing.T) {
+	t.Parallel()
+	if n := reflect.TypeOf(Fixture{}).NumField(); n != 2 {
+		t.Fatalf("Fixture has %d fields; update Corpus", n)
+	}
+}
+
 func TestCloneExpectIndependentCopies(t *testing.T) {
 	t.Parallel()
 	e := Expect{

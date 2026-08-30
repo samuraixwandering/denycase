@@ -72,42 +72,22 @@ func TestCorpusShape(t *testing.T) {
 		t.Fatal("Kind constants changed")
 	}
 	got := Corpus()
-	if len(got) != 5 {
-		t.Fatalf("Corpus() len %d, want 5; update README", len(got))
+	if len(got) != 6 {
+		t.Fatalf("Corpus() len %d, want 6; update README", len(got))
 	}
 	seenName := make(map[string]struct{}, len(got))
 	seenReq := make(map[string]struct{}, len(got))
-	have := map[Kind]int{}
-	xtGet, xtPut := false, false
-	relGet, relPut := false, false
-	moGet := false
+	have := map[Kind]map[string]bool{}
 	for i, f := range got {
 		switch f.Kind {
 		case KindCrossTenant, KindMissingOwner, KindRelationMismatch:
 		default:
 			t.Errorf("Corpus()[%d] unknown kind %q", i, f.Kind)
 		}
-		have[f.Kind]++
-		switch f.Kind {
-		case KindCrossTenant:
-			switch f.Case.Request.Method {
-			case http.MethodGet:
-				xtGet = true
-			case http.MethodPut:
-				xtPut = true
-			}
-		case KindRelationMismatch:
-			switch f.Case.Request.Method {
-			case http.MethodGet:
-				relGet = true
-			case http.MethodPut:
-				relPut = true
-			}
-		case KindMissingOwner:
-			if f.Case.Request.Method == http.MethodGet {
-				moGet = true
-			}
+		if have[f.Kind] == nil {
+			have[f.Kind] = map[string]bool{}
 		}
+		have[f.Kind][f.Case.Request.Method] = true
 		if f.Case.Name == "" {
 			t.Errorf("Corpus()[%d] empty name", i)
 			continue
@@ -127,31 +107,14 @@ func TestCorpusShape(t *testing.T) {
 		if !slices.Equal(f.Case.Expect.Status, []int{http.StatusForbidden}) {
 			t.Errorf("%q Status %v, want [403]", f.Case.Name, f.Case.Expect.Status)
 		}
-		hasUserA := slices.Contains(f.Case.Expect.BodyMustNot, "user-a")
-		if f.Case.Principal.ID == "user-a" {
-			if hasUserA {
-				t.Errorf("%q caller is user-a; user-a needle would false-fail", f.Case.Name)
-			}
-		} else if f.Case.Principal.Tenant == "tenant-B" && !hasUserA {
-			t.Errorf("%q tenant-B caller missing user-a needle", f.Case.Name)
-		}
 		if f.Case.Request.Header == nil {
 			t.Errorf("%q Header is nil", f.Case.Name)
 		}
 	}
 	for _, k := range []Kind{KindCrossTenant, KindMissingOwner, KindRelationMismatch} {
-		if have[k] == 0 {
-			t.Errorf("missing kind %s", k)
+		if !have[k][http.MethodGet] || !have[k][http.MethodPut] {
+			t.Errorf("want a %s GET and PUT", k)
 		}
-	}
-	if !xtGet || !xtPut {
-		t.Error("want a cross-tenant GET and PUT")
-	}
-	if !relGet || !relPut {
-		t.Error("want a relation_mismatch GET and PUT")
-	}
-	if !moGet {
-		t.Error("want a missing_owner GET")
 	}
 }
 
@@ -161,15 +124,17 @@ func TestCorpusReturnsIndependentCopies(t *testing.T) {
 	if len(a) < 2 {
 		t.Fatal("empty corpus")
 	}
-	var put *Case
+	var put, get *Case
 	for i := range a {
-		if len(a[i].Case.Request.Body) > 0 && a[i].Case.Request.Header != nil && len(a[i].Case.Request.Header["Content-Type"]) > 0 {
+		if put == nil && len(a[i].Case.Request.Body) > 0 && a[i].Case.Request.Header != nil && len(a[i].Case.Request.Header["Content-Type"]) > 0 {
 			put = &a[i].Case
-			break
+		}
+		if get == nil && a[i].Case.Request.Method == http.MethodGet && a[i].Case.Request.Header != nil {
+			get = &a[i].Case
 		}
 	}
-	if put == nil || len(a[0].Case.Expect.BodyMustNot) == 0 || len(a[0].Case.Expect.Status) == 0 {
-		t.Fatal("need a GET with needles/status and a PUT with body/header")
+	if put == nil || get == nil || len(a[0].Case.Expect.BodyMustNot) == 0 || len(a[0].Case.Expect.Status) == 0 {
+		t.Fatal("need a GET with needles/status/header and a PUT with body/header")
 	}
 	origNeedle := a[0].Case.Expect.BodyMustNot[0]
 	origStatus := a[0].Case.Expect.Status[0]
@@ -179,6 +144,7 @@ func TestCorpusReturnsIndependentCopies(t *testing.T) {
 	a[0].Case.Expect.Status[0] = http.StatusNotFound
 	put.Request.Body[0] ^= 0xff
 	put.Request.Header["Content-Type"][0] = "x"
+	get.Request.Header.Set("X-Caller", "leaked")
 
 	b := Corpus()
 	if b[0].Case.Expect.BodyMustNot[0] != origNeedle {
@@ -187,21 +153,29 @@ func TestCorpusReturnsIndependentCopies(t *testing.T) {
 	if b[0].Case.Expect.Status[0] != origStatus {
 		t.Fatalf("Status %d became %d", origStatus, b[0].Case.Expect.Status[0])
 	}
-	var putB *Case
+	var putB, getB *Case
 	for i := range b {
-		if len(b[i].Case.Request.Body) > 0 && b[i].Case.Request.Header != nil && len(b[i].Case.Request.Header["Content-Type"]) > 0 {
+		if putB == nil && len(b[i].Case.Request.Body) > 0 && b[i].Case.Request.Header != nil && len(b[i].Case.Request.Header["Content-Type"]) > 0 {
 			putB = &b[i].Case
-			break
+		}
+		if getB == nil && b[i].Case.Request.Method == http.MethodGet && b[i].Case.Request.Header != nil {
+			getB = &b[i].Case
 		}
 	}
 	if putB == nil {
 		t.Fatal("PUT missing after clone")
+	}
+	if getB == nil {
+		t.Fatal("GET missing after clone")
 	}
 	if putB.Request.Body[0] != origBody {
 		t.Fatalf("Body[0] %q became %q", origBody, putB.Request.Body[0])
 	}
 	if putB.Request.Header["Content-Type"][0] != origCT {
 		t.Fatalf("Content-Type %q became %q", origCT, putB.Request.Header["Content-Type"][0])
+	}
+	if getB.Request.Header.Get("X-Caller") != "" {
+		t.Fatalf("GET Header aliased %q", getB.Request.Header.Get("X-Caller"))
 	}
 }
 
@@ -275,34 +249,29 @@ func TestCorpusRejectsForbiddenRecordLeak(t *testing.T) {
 
 func TestCorpusWriteSendsJSONBody(t *testing.T) {
 	t.Parallel()
-	var want []byte
-	var wantCT string
-	for _, f := range Corpus() {
-		if f.Case.Request.Method == http.MethodPut {
-			want = slices.Clone(f.Case.Request.Body)
-			wantCT = f.Case.Request.Header.Get("Content-Type")
-			break
-		}
-	}
-	if len(want) == 0 || wantCT == "" {
-		t.Fatal("no PUT fixture with body and Content-Type")
-	}
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, err := io.ReadAll(r.Body)
-		if err != nil || !bytes.Equal(got, want) || r.Header.Get("Content-Type") != wantCT {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.Error(w, "forbidden", http.StatusForbidden)
-	})
+	n := 0
 	for _, f := range Corpus() {
 		if f.Case.Request.Method != http.MethodPut {
 			continue
 		}
+		n++
 		t.Run(f.Case.Name, func(t *testing.T) {
 			t.Parallel()
+			want := slices.Clone(f.Case.Request.Body)
+			wantCT := f.Case.Request.Header.Get("Content-Type")
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got, err := io.ReadAll(r.Body)
+				if err != nil || !bytes.Equal(got, want) || r.Header.Get("Content-Type") != wantCT {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				http.Error(w, "forbidden", http.StatusForbidden)
+			})
 			MustDeny(t, f.Case, h)
 		})
+	}
+	if n == 0 {
+		t.Fatal("no PUT fixture with body and Content-Type")
 	}
 }
 
@@ -412,6 +381,77 @@ func TestCorpusTenantBReadIsNotDenied(t *testing.T) {
 	if !got.failed || !strings.Contains(got.msg, "status 200") {
 		t.Fatalf("tenant-B read of inv-b should be 200, got failed=%v msg=%q panic=%v", got.failed, got.msg, got.panic)
 	}
+}
+
+func TestCorpusNoNeedleMatchesOwnPrincipal(t *testing.T) {
+	t.Parallel()
+	for _, f := range Corpus() {
+		for _, n := range f.Case.Expect.BodyMustNot {
+			if n == f.Case.Principal.ID {
+				t.Errorf("%q needles %q, which is the caller's own id", f.Case.Name, n)
+			}
+			if n == f.Case.Principal.Tenant {
+				t.Errorf("%q needles %q, which is the caller's own tenant", f.Case.Name, n)
+			}
+		}
+	}
+}
+
+func TestCorpusNeedlesRecordSecretAndForeignOwner(t *testing.T) {
+	t.Parallel()
+	n := 0
+	for _, f := range Corpus() {
+		id, ok := strings.CutPrefix(f.Case.Request.Path, "/invoices/")
+		if !ok || id == "" || strings.Contains(id, "/") {
+			continue
+		}
+		inv, ok := demoInvoices[id]
+		if !ok {
+			continue
+		}
+		n++
+		if !slices.Contains(f.Case.Expect.BodyMustNot, inv.secret) {
+			t.Errorf("%q targets %s but does not needle its secret %q", f.Case.Name, inv.id, inv.secret)
+		}
+		if f.Case.Principal.ID != inv.owner && !slices.Contains(f.Case.Expect.BodyMustNot, inv.owner) {
+			t.Errorf("%q caller %q is not the owner but does not needle the owner id %q", f.Case.Name, f.Case.Principal.ID, inv.owner)
+		}
+	}
+	if n == 0 {
+		t.Fatal("no fixture targeted a demo invoice")
+	}
+}
+
+func TestCorpusCatchesCrossTenantOverwrite(t *testing.T) {
+	t.Parallel()
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inv, ok := invoiceFrom(r)
+		if !ok {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		write := r.Method != http.MethodGet && r.Method != http.MethodHead
+		if !write && inv.tenant != r.Header.Get(HeaderTenant) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if write && inv.owner != r.Header.Get(HeaderPrincipal) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		writeInvoice(w, inv)
+	})
+	applicable := 0
+	for _, f := range Corpus() {
+		if f.Kind == KindRelationMismatch && f.Case.Request.Method == http.MethodGet {
+			continue
+		}
+		applicable++
+		if runMustDeny(t, f.Case, h).failed {
+			return
+		}
+	}
+	t.Fatalf("no applicable fixture detected the cross-tenant overwrite; %d ran and all passed", applicable)
 }
 
 func TestCorpusOwnerWithoutTenantAllowsCollidingID(t *testing.T) {
